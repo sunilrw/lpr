@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+*.parquet
+*.zip
+*.checkpoint.json
+.DS_Store

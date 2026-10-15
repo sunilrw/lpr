@@ -1,0 +1,39 @@
+[package]
+name = "lpr"
+version = "1.0.0"
+edition = "2021"
+description = "Complete Modern Rust SQL Log Parser & Security Auditor"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+datafusion = "42.0"
+arrow = { version = "53.0", features = ["prettyprint"] }
+parquet = { version = "53.0", features = ["arrow", "async"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+regex = "1.11"
+flate2 = "1.0"
+zstd = "0.13"
+evtx = "0.8"
+calamine = "0.26"
+glob = "0.3"
+urlencoding = "2.1"
+ipnet = "2.10"
+chrono = { version = "0.4", features = ["serde"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = "0.28"
+crossterm = "0.28"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tao = "0.30"
+wry = "0.44"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

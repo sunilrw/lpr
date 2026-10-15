@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>lpr Studio — Modern SQL Log Parser & Security Auditor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#eef2ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' },
+            soc: { bg: '#090d16', card: '#0f172a', border: '#1e293b', input: '#070b12' }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    body { background-color: #090d16; color: #f1f5f9; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #070b12; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+
+  <!-- Top App Navigation Bar -->
+  <header class="border-b border-slate-800/80 bg-slate-950/80 backdrop-blur sticky top-0 z-30 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+      <div class="h-9 w-9 rounded-lg bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-indigo-500/20 text-white font-black text-sm">
+        🛡️
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="text-base font-bold tracking-tight text-white">lpr Studio</span>
+          <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.0.0</span>
+          <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span> DataFusion 42
+          </span>
+        </div>
+        <p class="text-xs text-slate-400">High-Performance Rust SQL Log Engine & Threat Auditor</p>
+      </div>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <div class="flex items-center bg-slate-900 border border-slate-800 p-1 rounded-xl gap-1 text-xs font-medium">
+      <button id="tab-btn-sql" onclick="switchTab('sql')" class="px-3.5 py-1.5 rounded-lg transition-all flex items-center gap-2 bg-indigo-600 text-white shadow">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+        SQL Analytics
+      </button>
+      <button id="tab-btn-audit" onclick="switchTab('audit')" class="px-3.5 py-1.5 rounded-lg transition-all flex items-center gap-2 text-slate-400 hover:text-white">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+        Security Audit
+      </button>
+      <button id="tab-btn-docs" onclick="switchTab('docs')" class="px-3.5 py-1.5 rounded-lg transition-all flex items-center gap-2 text-slate-400 hover:text-white">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>
+        UDF Reference
+      </button>
+    </div>
+
+    <!-- Quick Sample File Pickers -->
+    <div class="flex items-center gap-2 text-xs">
+      <span class="text-slate-400 font-medium">Quick Samples:</span>
+      <button onclick="loadSample('nginx')" class="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 transition flex items-center gap-1.5">
+        <span class="h-2 w-2 rounded-full bg-cyan-400"></span> Nginx
+      </button>
+      <button onclick="loadSample('cisco')" class="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 transition flex items-center gap-1.5">
+        <span class="h-2 w-2 rounded-full bg-amber-400"></span> Cisco Config
+      </button>
+      <button onclick="loadSample('firewall')" class="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 transition flex items-center gap-1.5">
+        <span class="h-2 w-2 rounded-full bg-emerald-400"></span> Firewall KV
+      </button>
+      <button onclick="loadSample('json')" class="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 transition flex items-center gap-1.5">
+        <span class="h-2 w-2 rounded-full bg-purple-400"></span> Cloud JSON
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Body Container -->
+  <main class="flex-1 p-6 max-w-7xl w-full mx-auto space-y-6">
+
+    <!-- Source File & Format Control Bar -->
+    <div class="p-4 rounded-2xl bg-slate-900/90 border border-slate-800/80 shadow-xl space-y-3">
+      <div class="flex flex-col md:flex-row items-center gap-3">
+        <div class="flex-1 w-full relative">
+          <label class="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1">Log Source File / Glob Path</label>
+          <div class="relative flex items-center">
+            <span class="absolute left-3 text-slate-500">📁</span>
+            <input id="source" type="text" placeholder="/path/to/logfile.log or samples/*.log" value="samples/nginx_access.log"
+              class="w-full pl-9 pr-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700/80 text-sm mono text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" />
+          </div>
+        </div>
+
+        <div class="w-full md:w-56">
+          <label class="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1">Parser Format</label>
+          <select id="format" class="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700/80 text-sm mono text-slate-200 focus:outline-none focus:border-indigo-500">
+            <option value="auto">Auto Detect</option>
+            <option value="nginx" selected>Nginx / Apache</option>
+            <option value="cisco-config">Cisco Config (.cfg)</option>
+            <option value="firewall-kv">Firewall KV (FortiGate)</option>
+            <option value="syslog">Syslog / Auth.log</option>
+            <option value="json">JSON / NDJSON</option>
+            <option value="cisco-asa">Cisco ASA</option>
+            <option value="aws-s3">AWS S3 Access</option>
+            <option value="aws-vpc">AWS VPC Flow</option>
+            <option value="aws-alb">AWS ALB</option>
+            <option value="azure-blob">Azure Blob Storage</option>
+            <option value="gcp">GCP Cloud Logging</option>
+            <option value="cef">CEF (ArcSight)</option>
+            <option value="w3c">W3C / IIS Log</option>
+            <option value="csv">CSV</option>
+            <option value="tsv">TSV</option>
+            <option value="excel">Excel (.xlsx)</option>
+            <option value="parquet">Apache Parquet</option>
+            <option value="evtx">Windows EVTX</option>
+            <option value="line">Raw Lines</option>
+          </select>
+        </div>
+
+        <div class="flex items-end gap-2 w-full md:w-auto pt-5 md:pt-0">
+          <button onclick="runQuery()" id="btn-run" class="flex-1 md:flex-initial px-5 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-semibold text-xs tracking-wide shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition transform active:scale-95">
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"/></svg>
+            <span>Run SQL</span>
+            <span class="text-[10px] opacity-70 border border-white/20 px-1 py-0.5 rounded">⌘↵</span>
+          </button>
+          <button onclick="runAudit()" id="btn-audit" class="flex-1 md:flex-initial px-4 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-pink-600 hover:from-rose-500 hover:to-pink-500 text-white font-semibold text-xs tracking-wide shadow-lg shadow-rose-600/30 flex items-center justify-center gap-2 transition transform active:scale-95">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+            <span>Audit File</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 1: SQL Analytics Panel -->
+    <div id="tab-sql" class="space-y-4">
+
+      <!-- Query Presets / Quick Templates -->
+      <div class="flex items-center gap-2 flex-wrap text-xs">
+        <span class="text-slate-400 font-semibold flex items-center gap-1">⚡ Presets:</span>
+        <button onclick="applyPreset('threats')" class="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-rose-300 border border-rose-900/40 hover:border-rose-500/50 transition">
+          🚨 Detect Threats (SQLi / XSS / RCE)
+        </button>
+        <button onclick="applyPreset('subnets')" class="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-cyan-900/40 hover:border-cyan-500/50 transition">
+          🌐 Private vs Public Subnets (`ip_in_cidr`)
+        </button>
+        <button onclick="applyPreset('entropy')" class="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-amber-300 border border-amber-900/40 hover:border-amber-500/50 transition">
+          🎲 Shannon Entropy Scan
+        </button>
+        <button onclick="applyPreset('status_group')" class="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-indigo-300 border border-indigo-900/40 hover:border-indigo-500/50 transition">
+          📊 HTTP Status Codes
+        </button>
+        <button onclick="applyPreset('mask_pii')" class="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-emerald-300 border border-emerald-900/40 hover:border-emerald-500/50 transition">
+          🔒 Redact PII (`mask_pii`)
+        </button>
+        <button onclick="applyPreset('clustering')" class="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-purple-300 border border-purple-900/40 hover:border-purple-500/50 transition">
+          🧬 Template Clustering (`cluster_template`)
+        </button>
+      </div>
+
+      <!-- SQL Query Editor -->
+      <div class="rounded-2xl bg-slate-900 border border-slate-800 overflow-hidden shadow-2xl focus-within:border-indigo-500 transition">
+        <div class="px-4 py-2 border-b border-slate-800 bg-slate-950/60 flex items-center justify-between text-xs text-slate-400">
+          <span class="mono font-semibold text-indigo-400 flex items-center gap-1.5">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>
+            SQL Query (ANSI SQL / DataFusion)
+          </span>
+          <div class="flex items-center gap-2">
+            <button onclick="document.getElementById('sql').value='SELECT * FROM logs LIMIT 50'" class="hover:text-white transition">Clear / Reset</button>
+          </div>
+        </div>
+        <textarea id="sql" rows="4" spellcheck="false"
+          class="w-full p-4 bg-slate-950 text-emerald-300 mono text-sm focus:outline-none resize-y leading-relaxed font-mono">SELECT remote_addr, method, request_uri, status, detect_threat(request_uri) AS threat, ip_in_cidr(remote_addr, '192.168.0.0/16') AS is_private, ROUND(shannon_entropy(request_uri)::numeric, 2) AS entropy FROM logs</textarea>
+      </div>
+
+      <!-- Results Stats & Filter Bar -->
+      <div id="results-bar" class="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div class="flex items-center gap-3">
+          <span id="stat-rows" class="px-2.5 py-1 rounded-md bg-slate-800 text-slate-200 font-semibold border border-slate-700">0 rows</span>
+          <span id="stat-time" class="px-2.5 py-1 rounded-md bg-slate-800 text-slate-400 font-mono">0 ms</span>
+          <span id="stat-threats" class="hidden px-2.5 py-1 rounded-md bg-rose-950/80 text-rose-300 border border-rose-800 font-bold flex items-center gap-1.5"></span>
+        </div>
+
+        <div class="flex items-center gap-3 flex-1 justify-end">
+          <div class="relative max-w-xs w-full">
+            <input id="table-search" oninput="filterResultsTable()" type="text" placeholder="Filter rows in results..."
+              class="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700/80 text-xs mono text-slate-200 focus:outline-none focus:border-indigo-500" />
+          </div>
+          <button onclick="exportCSV()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1.5 font-medium">
+            <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+            Export CSV
+          </button>
+          <button onclick="exportJSON()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1.5 font-medium">
+            <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"/></svg>
+            Copy JSON
+          </button>
+        </div>
+      </div>
+
+      <!-- Results Table View -->
+      <div class="rounded-2xl border border-slate-800 bg-slate-900/60 overflow-hidden shadow-2xl">
+        <div class="overflow-x-auto max-h-[550px] relative">
+          <table class="w-full text-left text-xs mono border-collapse" id="result-table">
+            <tbody id="result-body">
+              <tr>
+                <td class="p-8 text-center text-slate-500 italic">No queries executed yet. Press <kbd class="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300">Run SQL</kbd> to inspect logs.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: Security Audit Panel -->
+    <div id="tab-audit" class="hidden space-y-5">
+      <div class="p-6 rounded-2xl bg-gradient-to-r from-slate-900 via-indigo-950/20 to-slate-900 border border-slate-800 flex items-center justify-between">
+        <div>
+          <h2 class="text-lg font-bold text-white flex items-center gap-2">
+            <span>🛡️ Automated SOC Compliance & Threat Audit</span>
+          </h2>
+          <p class="text-xs text-slate-400 mt-1">Evaluates firewall ACL policies, OWASP top 10 payloads, weak credentials, and cloud permissions.</p>
+        </div>
+        <button onclick="runAudit()" class="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 font-semibold text-white text-xs shadow-lg shadow-rose-600/30 flex items-center gap-2 transition active:scale-95">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          Re-Scan Target
+        </button>
+      </div>
+
+      <!-- Audit Results Container -->
+      <div id="audit-results" class="space-y-4">
+        <div class="p-8 rounded-2xl border border-slate-800 bg-slate-900/40 text-center text-slate-500">
+          Click <strong class="text-rose-400">Audit File</strong> above to run security checks on the target log or configuration file.
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: UDF & Schema Reference -->
+    <div id="tab-docs" class="hidden space-y-6">
+      <div>
+        <h2 class="text-lg font-bold text-white">Built-in Cyber & Security SQL Functions (UDFs)</h2>
+        <p class="text-xs text-slate-400 mt-0.5">Use these custom functions in your SQL queries against any log format.</p>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- Card 1 -->
+        <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="mono text-sm font-bold text-rose-400">detect_threat(column)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20">SecOps</span>
+          </div>
+          <p class="text-xs text-slate-300">Scans URL or string for exploit signatures: SQL Injection, XSS, Log4Shell/JNDI, Path Traversal (LFI), RCE, SSRF, and Scanners.</p>
+          <div class="p-2.5 rounded bg-slate-950 border border-slate-800/80 text-[11px] mono text-slate-300">
+            SELECT request_uri, detect_threat(request_uri) AS threat FROM logs
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="mono text-sm font-bold text-cyan-400">ip_in_cidr(ip, 'cidr/prefix')</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">Network</span>
+          </div>
+          <p class="text-xs text-slate-300">Evaluates whether an IPv4 or IPv6 string falls within a specified CIDR block (e.g. <code>10.0.0.0/8</code>, <code>192.168.0.0/16</code>).</p>
+          <div class="p-2.5 rounded bg-slate-950 border border-slate-800/80 text-[11px] mono text-slate-300">
+            SELECT remote_addr, ip_in_cidr(remote_addr, '10.0.0.0/8') AS is_corp FROM logs
+          </div>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="mono text-sm font-bold text-amber-400">shannon_entropy(column)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">Anomaly</span>
+          </div>
+          <p class="text-xs text-slate-300">Calculates Shannon entropy score (0.0 to 8.0) of a string. High entropy flags base64 payloads, obfuscation, or DGA domains.</p>
+          <div class="p-2.5 rounded bg-slate-950 border border-slate-800/80 text-[11px] mono text-slate-300">
+            SELECT request_uri, shannon_entropy(request_uri) FROM logs WHERE shannon_entropy(request_uri) &gt; 4.2
+          </div>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="mono text-sm font-bold text-emerald-400">mask_pii(column)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Privacy</span>
+          </div>
+          <p class="text-xs text-slate-300">Anonymizes PII like email addresses, replacing them with <code>[REDACTED_EMAIL]</code> for GDPR/HIPAA compliance.</p>
+          <div class="p-2.5 rounded bg-slate-950 border border-slate-800/80 text-[11px] mono text-slate-300">
+            SELECT mask_pii("user"), event FROM logs
+          </div>
+        </div>
+
+        <!-- Card 5 -->
+        <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="mono text-sm font-bold text-purple-400">cluster_template(column)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20">Drain / NLP</span>
+          </div>
+          <p class="text-xs text-slate-300">Replaces dynamic variables (IPs, UUIDs, IDs, numbers) with <code>&lt;*&gt;</code> to aggregate millions of logs into common templates.</p>
+          <div class="p-2.5 rounded bg-slate-950 border border-slate-800/80 text-[11px] mono text-slate-300">
+            SELECT cluster_template(message), count(*) FROM logs GROUP BY 1 ORDER BY 2 DESC
+          </div>
+        </div>
+
+        <!-- Card 6 -->
+        <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="mono text-sm font-bold text-indigo-400">url_decode(column) &amp; parse_ua(column)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Utility</span>
+          </div>
+          <p class="text-xs text-slate-300">Decodes percent-encoded URIs and extracts browser/crawler details from User-Agent headers.</p>
+          <div class="p-2.5 rounded bg-slate-950 border border-slate-800/80 text-[11px] mono text-slate-300">
+            SELECT url_decode(request_uri), parse_ua(http_user_agent) FROM logs
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="border-t border-slate-800/60 py-4 px-6 text-center text-xs text-slate-500">
+    <span>lpr Studio • Modern SQL Log Parser & Security Auditor • Built in Rust with Apache Arrow & DataFusion</span>
+  </footer>
+
+  <script>
+    let currentRawData = [];
+
+    // Switch between tabs
+    function switchTab(tab) {
+      ['sql', 'audit', 'docs'].forEach(t => {
+        const panel = document.getElementById(`tab-${t}`);
+        const btn = document.getElementById(`tab-btn-${t}`);
+        if (t === tab) {
+          panel.classList.remove('hidden');
+          btn.className = "px-3.5 py-1.5 rounded-lg transition-all flex items-center gap-2 bg-indigo-600 text-white shadow";
+        } else {
+          panel.classList.add('hidden');
+          btn.className = "px-3.5 py-1.5 rounded-lg transition-all flex items-center gap-2 text-slate-400 hover:text-white";
+        }
+      });
+    }
+
+    // Load sample files
+    function loadSample(type) {
+      if (type === 'nginx') {
+        document.getElementById('source').value = 'samples/nginx_access.log';
+        document.getElementById('format').value = 'nginx';
+        document.getElementById('sql').value = "SELECT remote_addr, method, request_uri, status, detect_threat(request_uri) AS threat, ip_in_cidr(remote_addr, '192.168.0.0/16') AS is_private, ROUND(shannon_entropy(request_uri)::numeric, 2) AS entropy FROM logs";
+      } else if (type === 'cisco') {
+        document.getElementById('source').value = 'samples/cisco_switch.cfg';
+        document.getElementById('format').value = 'cisco-config';
+        document.getElementById('sql').value = "SELECT file, line_number, section, directive FROM logs WHERE directive LIKE '%any%' OR directive LIKE '%password%'";
+      } else if (type === 'firewall') {
+        document.getElementById('source').value = 'samples/firewall.log';
+        document.getElementById('format').value = 'firewall-kv';
+        document.getElementById('sql').value = "SELECT date, time, devname, srcip, dstip, dstport, action, sentbyte, rcvdbyte FROM logs";
+      } else if (type === 'json') {
+        document.getElementById('source').value = 'samples/cloud_events.json';
+        document.getElementById('format').value = 'json';
+        document.getElementById('sql').value = 'SELECT timestamp, service, event, mask_pii("user") AS user_redacted, ip, status FROM logs';
+      }
+      runQuery();
+    }
+
+    // Apply quick SQL presets
+    function applyPreset(key) {
+      if (key === 'threats') {
+        document.getElementById('sql').value = "SELECT remote_addr, method, request_uri, status, detect_threat(request_uri) AS threat_type FROM logs WHERE detect_threat(request_uri) != 'CLEAN'";
+      } else if (key === 'subnets') {
+        document.getElementById('sql').value = "SELECT remote_addr, ip_in_cidr(remote_addr, '10.0.0.0/8') AS in_10_net, ip_in_cidr(remote_addr, '192.168.0.0/16') AS in_192_net, count(*) as hits FROM logs GROUP BY 1, 2, 3";
+      } else if (key === 'entropy') {
+        document.getElementById('sql').value = "SELECT request_uri, ROUND(shannon_entropy(request_uri)::numeric, 3) AS entropy FROM logs ORDER BY entropy DESC LIMIT 20";
+      } else if (key === 'status_group') {
+        document.getElementById('sql').value = "SELECT status, count(*) AS total_requests, round(count(*) * 100.0 / sum(count(*)) over (), 2) as pct FROM logs GROUP BY status ORDER BY total_requests DESC";
+      } else if (key === 'mask_pii') {
+        document.getElementById('sql').value = 'SELECT timestamp, service, event, mask_pii("user") AS masked_email FROM logs';
+      } else if (key === 'clustering') {
+        document.getElementById('sql').value = "SELECT cluster_template(request_uri) AS uri_pattern, count(*) AS frequency FROM logs GROUP BY 1 ORDER BY 2 DESC LIMIT 20";
+      }
+      runQuery();
+    }
+
+    // Execute SQL query via /v1/query
+    async function runQuery() {
+      switchTab('sql');
+      const btn = document.getElementById('btn-run');
+      const originalText = btn.innerHTML;
+      btn.innerHTML = `<svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg> Running...`;
+      btn.disabled = true;
+
+      const sql = document.getElementById('sql').value;
+      const source = document.getElementById('source').value;
+      const format = document.getElementById('format').value;
+
+      try {
+        const res = await fetch('/v1/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sql, source: source.trim() ? source.trim() : null, format: format !== 'auto' ? format : null })
+        });
+        const payload = await res.json();
+
+        if (!res.ok || payload.error) {
+          renderError(payload.error || 'Unknown query execution error');
+          return;
+        }
+
+        currentRawData = payload.data || [];
+        document.getElementById('stat-rows').innerText = `${payload.row_count || 0} rows`;
+        document.getElementById('stat-time').innerText = `${payload.execution_time_ms ?? 0} ms`;
+
+        // Check for threats in results
+        let threatCount = 0;
+        currentRawData.forEach(r => {
+          Object.values(r).forEach(val => {
+            if (typeof val === 'string' && (val.includes('HIGH:') || val.includes('CRITICAL:') || val.includes('MEDIUM:'))) threatCount++;
+          });
+        });
+
+        const threatBadge = document.getElementById('stat-threats');
+        if (threatCount > 0) {
+          threatBadge.innerText = `🚨 ${threatCount} Threats Detected`;
+          threatBadge.className = 'px-2.5 py-1 rounded-md bg-rose-950/80 text-rose-300 border border-rose-800 font-bold flex items-center gap-1.5';
+          threatBadge.classList.remove('hidden');
+        } else {
+          threatBadge.innerText = `🛡️ All Clean`;
+          threatBadge.className = 'px-2.5 py-1 rounded-md bg-emerald-950/80 text-emerald-300 border border-emerald-800 font-bold flex items-center gap-1.5';
+          threatBadge.classList.remove('hidden');
+        }
+
+        renderResultsTable(currentRawData);
+      } catch (err) {
+        renderError(err.message);
+      } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+      }
+    }
+
+    // Render results in table with threat highlights
+    function renderResultsTable(data) {
+      const t = document.getElementById('result-table');
+      if (!data || !data.length) {
+        t.innerHTML = '<tbody><tr><td class="p-8 text-center text-slate-500 italic">Query executed successfully with 0 rows returned.</td></tr></tbody>';
+        return;
+      }
+
+      const cols = Object.keys(data[0]);
+      let html = '<thead class="bg-slate-950/90 sticky top-0 z-10 border-b border-slate-800 text-slate-300"><tr>';
+      cols.forEach(c => {
+        html += `<th class="p-3 text-left font-semibold tracking-wider text-[11px] uppercase border-r border-slate-800/60 last:border-r-0">${c}</th>`;
+      });
+      html += '</tr></thead><tbody class="divide-y divide-slate-800/40 bg-slate-900/30">';
+
+      data.forEach((row, i) => {
+        const bg = i % 2 === 0 ? 'bg-slate-900/20 hover:bg-indigo-950/20' : 'bg-slate-950/20 hover:bg-indigo-950/20';
+        html += `<tr class="${bg} transition-colors">`;
+        cols.forEach(c => {
+          let val = row[c] ?? '';
+          let badge = '';
+
+          if (typeof val === 'string') {
+            if (val.startsWith('CRITICAL:')) {
+              badge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">${val}</span>`;
+            } else if (val.startsWith('HIGH:')) {
+              badge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30">${val}</span>`;
+            } else if (val.startsWith('MEDIUM:')) {
+              badge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">${val}</span>`;
+            } else if (val === 'CLEAN') {
+              badge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-800 text-slate-400 border border-slate-700">CLEAN</span>`;
+            } else if (val === 'true') {
+              badge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">true</span>`;
+            } else if (val === 'false') {
+              badge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">false</span>`;
+            } else if (c === 'status' && !isNaN(val)) {
+              const code = parseInt(val);
+              const color = code < 300 ? 'text-emerald-400 bg-emerald-500/10' : (code < 400 ? 'text-cyan-400 bg-cyan-500/10' : (code < 500 ? 'text-amber-400 bg-amber-500/10' : 'text-rose-400 bg-rose-500/10'));
+              badge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold ${color}">${val}</span>`;
+            }
+          }
+
+          html += `<td class="p-3 truncate max-w-sm border-r border-slate-800/40 last:border-r-0 text-slate-200" title="${escapeHtml(String(val))}">${badge || escapeHtml(String(val))}</td>`;
+        });
+        html += '</tr>';
+      });
+
+      html += '</tbody>';
+      t.innerHTML = html;
+    }
+
+    // Filter table rows client-side
+    function filterResultsTable() {
+      const q = document.getElementById('table-search').value.toLowerCase();
+      if (!q) {
+        renderResultsTable(currentRawData);
+        return;
+      }
+      const filtered = currentRawData.filter(r => {
+        return Object.values(r).some(v => String(v).toLowerCase().includes(q));
+      });
+      renderResultsTable(filtered);
+      document.getElementById('stat-rows').innerText = `${filtered.length} / ${currentRawData.length} filtered`;
+    }
+
+    // Render error
+    function renderError(msg) {
+      const t = document.getElementById('result-table');
+      t.innerHTML = `<tbody><tr><td class="p-6 text-center text-rose-400 bg-rose-950/20 border-t border-rose-900/40 mono text-xs">
+        <div class="font-bold mb-1">⚠️ Query Execution Failed</div>
+        <div class="text-slate-300">${escapeHtml(msg)}</div>
+      </td></tr></tbody>`;
+      document.getElementById('stat-rows').innerText = '0 rows';
+      document.getElementById('stat-threats').classList.add('hidden');
+    }
+
+    // Run Security Audit via /v1/audit
+    async function runAudit() {
+      switchTab('audit');
+      const container = document.getElementById('audit-results');
+      container.innerHTML = `<div class="p-12 text-center text-indigo-400 mono text-xs animate-pulse">Running security audit scan on target file...</div>`;
+
+      const source = document.getElementById('source').value;
+      const format = document.getElementById('format').value;
+
+      try {
+        const res = await fetch('/v1/audit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: source.trim() ? source.trim() : null, format: format !== 'auto' ? format : null })
+        });
+        const payload = await res.json();
+
+        if (!res.ok || payload.error) {
+          container.innerHTML = `<div class="p-6 rounded-2xl bg-rose-950/20 border border-rose-900/40 text-rose-400 text-xs mono">
+            <strong>Audit Failed:</strong> ${escapeHtml(payload.error || 'Unknown audit error')}
+          </div>`;
+          return;
+        }
+
+        const findings = payload.findings || [];
+        const detected = payload.detected_format || 'Auto';
+
+        if (findings.length === 0) {
+          container.innerHTML = `
+            <div class="p-8 rounded-2xl bg-emerald-950/20 border border-emerald-900/40 text-center space-y-2">
+              <div class="text-3xl">✅</div>
+              <h3 class="text-base font-bold text-emerald-400">No Security Findings Detected</h3>
+              <p class="text-xs text-slate-400">Target <code>${escapeHtml(source)}</code> (Profile: <code>${detected}</code>) passed all compliance and threat scan rules.</p>
+            </div>`;
+          return;
+        }
+
+        let html = `
+          <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between text-xs">
+            <div>
+              <span class="text-slate-400 font-semibold">Target:</span> <span class="mono text-slate-200">${escapeHtml(source)}</span>
+              <span class="ml-3 text-slate-400 font-semibold">Profile:</span> <span class="mono px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">${escapeHtml(detected)}</span>
+            </div>
+            <div>
+              <span class="px-2.5 py-1 rounded bg-rose-500/20 text-rose-400 font-bold border border-rose-500/30">${findings.length} Finding(s) Triggered</span>
+            </div>
+          </div>
+          <div class="space-y-4">`;
+
+        findings.forEach((f, idx) => {
+          const sevColor = f.severity === 'CRITICAL' ? 'rose' : (f.severity === 'HIGH' ? 'orange' : 'amber');
+          html += `
+            <div class="rounded-2xl border border-${sevColor}-900/40 bg-slate-900/80 overflow-hidden shadow-lg">
+              <div class="p-4 bg-slate-950/80 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="px-2 py-0.5 rounded text-[10px] font-black tracking-wider uppercase bg-${sevColor}-500/20 text-${sevColor}-400 border border-${sevColor}-500/30">${f.severity}</span>
+                  <span class="text-xs font-mono font-bold text-slate-200">${f.category}</span>
+                  <span class="text-xs text-slate-400">— ${f.title}</span>
+                </div>
+                <span class="text-[11px] mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">${f.matched_count} match(es)</span>
+              </div>
+              <div class="p-4 space-y-3">
+                <div class="p-3 rounded-xl bg-indigo-950/20 border border-indigo-900/30 flex items-start gap-2.5 text-xs text-slate-300">
+                  <span class="text-indigo-400 text-sm">💡</span>
+                  <div>
+                    <strong class="text-indigo-300">Remediation:</strong> ${escapeHtml(f.remediation)}
+                  </div>
+                </div>
+                ${f.sample_evidence ? `
+                <div>
+                  <div class="text-[11px] font-semibold text-slate-400 mb-1">Evidence Records:</div>
+                  <pre class="p-3 rounded-xl bg-slate-950 border border-slate-800/80 text-[11px] mono text-emerald-300 overflow-x-auto whitespace-pre leading-relaxed">${escapeHtml(f.sample_evidence)}</pre>
+                </div>` : ''}
+              </div>
+            </div>`;
+        });
+
+        html += `</div>`;
+        container.innerHTML = html;
+      } catch (err) {
+        container.innerHTML = `<div class="p-6 rounded-2xl bg-rose-950/20 border border-rose-900/40 text-rose-400 text-xs mono">
+          <strong>Audit Request Error:</strong> ${escapeHtml(err.message)}
+        </div>`;
+      }
+    }
+
+    // Export CSV
+    function exportCSV() {
+      if (!currentRawData || !currentRawData.length) return;
+      const cols = Object.keys(currentRawData[0]);
+      let csv = cols.join(',') + '\n';
+      currentRawData.forEach(r => {
+        csv += cols.map(c => `"${String(r[c] ?? '').replace(/"/g, '""')}"`).join(',') + '\n';
+      });
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'lpr_query_export.csv';
+      a.click();
+    }
+
+    // Copy JSON to clipboard
+    function exportJSON() {
+      if (!currentRawData || !currentRawData.length) return;
+      navigator.clipboard.writeText(JSON.stringify(currentRawData, null, 2));
+      alert('Copied results JSON to clipboard!');
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // Keyboard shortcut: Cmd+Enter or Ctrl+Enter to execute query
+    document.addEventListener('keydown', e => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        runQuery();
+      }
+    });
+
+    // Auto-run default query on load
+    window.addEventListener('DOMContentLoaded', () => {
+      runQuery();
+    });
+  </script>
+</body>
+</html>

