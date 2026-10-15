@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(feature = "gui")]
 pub fn launch_native_desktop_gui(default_source: Option<String>) -> Result<()> {
     use tao::{
         event::{Event, WindowEvent},
@@ -35,7 +35,7 @@ pub fn launch_native_desktop_gui(default_source: Option<String>) -> Result<()> {
     });
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+#[cfg(not(feature = "gui"))]
 pub fn launch_native_desktop_gui(_default_source: Option<String>) -> Result<()> {
-    anyhow::bail!("Native desktop GUI is only supported on macOS, Windows, and Linux")
+    anyhow::bail!("Native desktop GUI was not compiled into this standalone server build.\nTo access the Web UI, run:\n  lpr serve --bind 127.0.0.1:8080\nand open http://127.0.0.1:8080 in your browser.")
 }
