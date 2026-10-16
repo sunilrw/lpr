@@ -220,11 +220,12 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 #[derive(Debug, Clone, Default)]
 pub struct ScanPreFilter {
     pub min_date: Option<String>,
+    pub min_time: Option<String>,
     pub status_prefix: Option<String>,
 }
 
 static RE_IIS_DATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)u_(?:ex|in)(\d{2})(\d{2})(\d{2})(?:\d{2})?").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)u_(?:ex|in)(\d{2})(\d{2})(\d{2})(\d{2})?").unwrap());
 static RE_ISO_DATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"((?:19|20)\d{2})-(\d{2})-(\d{2})").unwrap());
 static RE_COMPACT_YYYYMMDD: LazyLock<Regex> = LazyLock::new(|| {
@@ -391,6 +392,102 @@ pub fn filter_items_by_min_date(
             }
         })
         .collect()
+}
+
+/// Returns (date, optional hour) embedded in a log filename. `u_exYYMMDDHH`
+/// hourly IIS files yield an hour; daily names and generic dates yield None.
+fn filename_date_hour(name: &str) -> (Option<chrono::NaiveDate>, Option<u32>) {
+    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if let Some(cap) = RE_IIS_DATE.captures_iter(stem).last() {
+        let yy: i32 = cap[1].parse().unwrap_or(0);
+        let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
+        if let (Ok(mo), Ok(d)) = (cap[2].parse::<u32>(), cap[3].parse::<u32>()) {
+            if let Some(dt) = chrono::NaiveDate::from_ymd_opt(year, mo, d) {
+                let hh = cap
+                    .get(4)
+                    .and_then(|m| m.as_str().parse::<u32>().ok())
+                    .filter(|h| *h < 24);
+                return (Some(dt), hh);
+            }
+        }
+    }
+    (filename_embedded_date(name), None)
+}
+
+/// Drops log files that provably contain no rows on/after `cutoff` DATETIME —
+/// hour-precision variant of `filter_items_by_min_date` for `--hours` scans.
+/// Hourly-named files compare on full datetime; date-only named files are kept
+/// if their day is in window; everything else falls back to file mtime.
+pub fn filter_items_by_datetime(
+    items: Vec<LogSourceItem>,
+    cutoff: chrono::NaiveDateTime,
+) -> Vec<LogSourceItem> {
+    let cutoff_date = cutoff.date();
+    let mtime_recent = |r: std::io::Result<std::time::SystemTime>| {
+        r.map(|t| {
+            let t: chrono::DateTime<chrono::Utc> = t.into();
+            t.naive_utc() >= cutoff
+        })
+        .unwrap_or(true)
+    };
+    items
+        .into_iter()
+        .filter(|item| {
+            let name = item.display_name();
+            let (fd, fh) = filename_date_hour(&name);
+            if let (Some(d), Some(h)) = (fd, fh) {
+                return d.and_hms_opt(h, 0, 0).map(|dt| dt >= cutoff).unwrap_or(true);
+            }
+            if let Some(d) = fd {
+                return d >= cutoff_date;
+            }
+            match item {
+                LogSourceItem::DiskFile(p) => mtime_recent(std::fs::metadata(p).and_then(|m| m.modified())),
+                LogSourceItem::ZipEntry { archive_path, .. } => {
+                    mtime_recent(std::fs::metadata(archive_path).and_then(|m| m.modified()))
+                }
+                LogSourceItem::Stdin => true,
+            }
+        })
+        .collect()
+}
+
+/// Keeps only the newest log item(s) — the "currently active" log file per
+/// server (`--latest`). Filename date+hour wins over mtime; all entries from
+/// the newest archive are kept together.
+pub fn keep_latest_log_item(items: Vec<LogSourceItem>) -> Vec<LogSourceItem> {
+    fn recency_key(item: &LogSourceItem) -> chrono::NaiveDateTime {
+        let name = item.display_name();
+        let (fd, fh) = filename_date_hour(&name);
+        if let Some(d) = fd {
+            return d
+                .and_hms_opt(fh.unwrap_or(23), 59, 59)
+                .unwrap_or_else(|| d.and_hms_opt(0, 0, 0).unwrap());
+        }
+        let mt = match item {
+            LogSourceItem::DiskFile(p) => {
+                std::fs::metadata(p).and_then(|m| m.modified()).ok()
+            }
+            LogSourceItem::ZipEntry { archive_path, .. } => {
+                std::fs::metadata(archive_path).and_then(|m| m.modified()).ok()
+            }
+            LogSourceItem::Stdin => None,
+        };
+        mt.map(|t| {
+            let t: chrono::DateTime<chrono::Utc> = t.into();
+            t.naive_utc()
+        })
+        .unwrap_or(chrono::NaiveDateTime::MIN)
+    }
+    if items.len() <= 1 {
+        return items;
+    }
+    let best = items
+        .iter()
+        .map(recency_key)
+        .max()
+        .unwrap_or(chrono::NaiveDateTime::MIN);
+    items.into_iter().filter(|i| recency_key(i) == best).collect()
 }
 
 pub fn open_source_item_reader(
@@ -801,7 +898,9 @@ pub fn parse_w3c_items_parallel_filtered(
     let num_data_cols = canonical_fields.len();
     let canon_status_idx = canonical_fields.iter().position(|c| c == "sc_status");
     let canon_date_idx = canonical_fields.iter().position(|c| c == "date");
+    let canon_time_idx = canonical_fields.iter().position(|c| c == "time");
     let filter_min_date = pre_filter.and_then(|f| f.min_date.as_deref());
+    let filter_min_time = pre_filter.and_then(|f| f.min_time.as_deref());
     let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
 
     // Step 2: Process every file / ZIP entry in parallel via Rayon!
@@ -825,6 +924,7 @@ pub fn parse_w3c_items_parallel_filtered(
             let mut first_chunk = true;
             let mut file_status_idx = canon_status_idx;
             let mut file_date_idx = canon_date_idx;
+            let mut file_time_idx = canon_time_idx;
             let mut file_num_cols = num_data_cols;
             // Maps canonical column `c` -> token index in this file (None if canonical matches 1:1)
             let mut custom_col_map: Option<Vec<Option<usize>>> = None;
@@ -876,6 +976,7 @@ pub fn parse_w3c_items_parallel_filtered(
                                 file_num_cols = file_cols.len();
                                 file_status_idx = file_cols.iter().position(|c| c == "sc_status");
                                 file_date_idx = file_cols.iter().position(|c| c == "date");
+                                file_time_idx = file_cols.iter().position(|c| c == "time");
                                 if file_cols != canonical_fields {
                                     let map: Vec<Option<usize>> = canonical_fields
                                         .iter()
@@ -923,6 +1024,14 @@ pub fn parse_w3c_items_parallel_filtered(
                         if let Some(d_idx) = file_date_idx {
                             if d_idx < t_count && !tokens[d_idx].is_empty() && tokens[d_idx] < md {
                                 continue;
+                            }
+                            if let (Some(mt), Some(t_idx)) = (filter_min_time, file_time_idx) {
+                                if t_idx < t_count
+                                    && tokens[d_idx] == md
+                                    && tokens[t_idx] < mt
+                                {
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1028,7 +1137,9 @@ fn parse_w3c_single_item_utf16(
     let mut row_count = 0;
     let status_idx = schema.fields().iter().position(|f| f.name() == "sc_status");
     let date_idx = schema.fields().iter().position(|f| f.name() == "date");
+    let time_idx = schema.fields().iter().position(|f| f.name() == "time");
     let filter_min_date = pre_filter.and_then(|f| f.min_date.as_deref());
+    let filter_min_time = pre_filter.and_then(|f| f.min_time.as_deref());
     let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
 
     for (idx, line) in lines.iter().enumerate() {
@@ -1049,6 +1160,11 @@ fn parse_w3c_single_item_utf16(
                 if let Some(d_idx) = date_idx {
                     if d_idx < parts.len() && !parts[d_idx].is_empty() && parts[d_idx] < md {
                         continue;
+                    }
+                    if let (Some(mt), Some(t_idx)) = (filter_min_time, time_idx) {
+                        if t_idx < parts.len() && parts[d_idx] == md && parts[t_idx] < mt {
+                            continue;
+                        }
                     }
                 }
             }

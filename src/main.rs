@@ -263,8 +263,16 @@ enum Commands {
     #[command(alias = "scan-500")]
     Fleet {
         /// Number of days to look back (inclusive, default: 7)
-        #[arg(short = 'd', long = "days")]
+        #[arg(short = 'd', long = "days", conflicts_with = "hours")]
         days: Option<i64>,
+
+        /// Rolling hour window instead of --days (e.g. --hours 3 = only the last 3 hours)
+        #[arg(long = "hours", value_name = "N")]
+        hours: Option<i64>,
+
+        /// Scan only the newest (currently active) log file per server
+        #[arg(long = "latest")]
+        latest: bool,
 
         /// IIS Site folder name under log roots (e.g. --site W3SVC1 or --site MySite)
         #[arg(long = "site")]
@@ -842,6 +850,8 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Fleet {
             days,
+            hours,
+            latest,
             site,
             report_prefix,
             servers,
@@ -873,6 +883,8 @@ async fn main() -> Result<()> {
                 save_profile_name: cli.save_profile.clone(),
                 list_profiles: cli.list_profiles,
                 days,
+                hours,
+                latest_only: latest,
                 site_name: site,
                 report_prefix,
                 servers_csv: servers,

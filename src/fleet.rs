@@ -1,8 +1,8 @@
 use crate::sym::*;
 use crate::engine::LogEngine;
 use crate::parsers::{
-    filter_items_by_min_date, resolve_source_items, resolve_source_items_with_cutoff, InputFormat,
-    ScanPreFilter,
+    filter_items_by_datetime, filter_items_by_min_date, keep_latest_log_item,
+    resolve_source_items, resolve_source_items_with_cutoff, InputFormat, ScanPreFilter,
 };
 use crate::sinks::batches_to_json_value;
 use anyhow::Result;
@@ -74,6 +74,12 @@ pub struct SavedProfile {
     pub server_numbers: Option<String>,
     #[serde(default)]
     pub local_path: Option<String>,
+    /// Rolling hour window for fleet scans (overrides `days` when set)
+    #[serde(default)]
+    pub hours: Option<i64>,
+    /// Scan only the newest (currently active) log file per server
+    #[serde(default)]
+    pub latest_only: Option<bool>,
     /// Default SQL query or input/output format for general `lpr` CLI runs using this profile
     #[serde(default)]
     pub default_sql: Option<String>,
@@ -121,6 +127,8 @@ impl Default for SavedProfile {
             server_filter: None,
             server_numbers: None,
             local_path: None,
+            hours: None,
+            latest_only: None,
             default_sql: None,
             input_format: None,
             output_format: None,
@@ -208,6 +216,8 @@ pub struct FleetScanConfig {
     pub local_path: Option<String>,
     pub status_prefix: Option<String>,
     pub custom_sql: Option<String>,
+    pub hours: Option<i64>,
+    pub latest_only: bool,
     pub threads: Option<usize>,
     pub verbose: bool,
 }
@@ -379,6 +389,12 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     if let Some(ref q) = req.custom_sql {
         profile.default_sql = Some(q.clone());
     }
+    if let Some(h) = req.hours {
+        profile.hours = Some(h);
+    }
+    if req.latest_only {
+        profile.latest_only = Some(true);
+    }
     if let Some(ref o) = req.output_dir {
         profile.output_dir = Some(o.clone());
     }
@@ -535,9 +551,22 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     let threads = profile.threads;
     let verbose = profile.verbose.unwrap_or(req.verbose);
 
-    let cutoff_date = (Utc::now() - Duration::days((days - 1).max(0)))
-        .format("%Y-%m-%d")
-        .to_string();
+    let hours = profile.hours;
+    let latest_only = profile.latest_only.unwrap_or(false);
+    let (cutoff_date, cutoff_time): (String, Option<String>) = if let Some(h) = hours {
+        let dt = Utc::now() - Duration::hours(h.max(0));
+        (
+            dt.format("%Y-%m-%d").to_string(),
+            Some(dt.format("%H:%M:%S").to_string()),
+        )
+    } else {
+        (
+            (Utc::now() - Duration::days((days - 1).max(0)))
+                .format("%Y-%m-%d")
+                .to_string(),
+            None,
+        )
+    };
     let run_stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
 
     fs::create_dir_all(&output_dir)?;
@@ -545,9 +574,17 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     println!("================================================================================");
     println!(" {SYM_GLOBE} LPR MULTI-SERVER FLEET SCANNER (Profile: `{}`)", active_profile_name);
     println!(
-        " {SYM_CAL} Days: {} (Cutoff >= {}) | {} | Threads: {}",
-        days,
-        cutoff_date,
+        " {SYM_CAL} {} | {} | Threads: {}{}",
+        if let Some(h) = hours {
+            format!(
+                "Hours: {} (Cutoff >= {} {})",
+                h,
+                cutoff_date,
+                cutoff_time.as_deref().unwrap_or("")
+            )
+        } else {
+            format!("Days: {} (Cutoff >= {})", days, cutoff_date)
+        },
         if custom_sql.is_some() {
             "Mode: Custom SQL".to_string()
         } else {
@@ -555,7 +592,8 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         },
         threads
             .map(|t| t.to_string())
-            .unwrap_or_else(|| "Auto (All Cores)".to_string())
+            .unwrap_or_else(|| "Auto (All Cores)".to_string()),
+        if latest_only { " | Latest file only" } else { "" }
     );
     println!(" {SYM_FOLDER} Output Folder: {} | Report Prefix: {}", output_dir, report_prefix);
     println!("================================================================================");
@@ -564,6 +602,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         return run_local_or_archive_fleet_scan(
             local_target,
             &cutoff_date,
+            cutoff_time.as_deref(),
             &run_stamp,
             &output_dir,
             &report_prefix,
@@ -572,6 +611,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             threads,
             verbose,
             custom_sql.as_deref(),
+            latest_only,
         )
         .await;
     }
@@ -642,6 +682,8 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 threads,
                 verbose,
                 custom_sql.as_deref(),
+                hours,
+                latest_only,
             )
             .await
             {
@@ -779,9 +821,24 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         let joined_pattern = existing_paths.join(";");
         let cutoff_naive = chrono::NaiveDate::parse_from_str(&cutoff_date, "%Y-%m-%d")
             .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+        let cutoff_dt = cutoff_time.as_ref().and_then(|t| {
+            chrono::NaiveDateTime::parse_from_str(
+                &format!("{} {}", cutoff_date, t),
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .ok()
+        });
         let all_items = resolve_source_items(&joined_pattern).unwrap_or_default();
         let total_files = all_items.len();
-        let items = filter_items_by_min_date(all_items, cutoff_naive);
+        let items = match cutoff_dt {
+            Some(cdt) => filter_items_by_datetime(all_items, cdt),
+            None => filter_items_by_min_date(all_items, cutoff_naive),
+        };
+        let items = if latest_only {
+            keep_latest_log_item(items)
+        } else {
+            items
+        };
         let files_count = items.len();
         if items.is_empty() {
             println!(
@@ -804,6 +861,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         }
         let pre_filter = ScanPreFilter {
             min_date: Some(cutoff_date.clone()),
+            min_time: cutoff_time.clone(),
             status_prefix: if custom_sql.is_some() {
                 None
             } else {
@@ -827,7 +885,12 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             Ok(detected_fmt) => {
                 let cols = engine.table_columns("logs").await;
                 let sql = custom_sql.clone().unwrap_or_else(|| {
-                    build_multi_format_error_sql(&cols, &status_prefix, &cutoff_date)
+                    build_multi_format_error_sql(
+                        &cols,
+                        &status_prefix,
+                        &cutoff_date,
+                        cutoff_time.as_deref(),
+                    )
                 });
                 match engine.query(&sql).await {
                     Ok(batches) => {
@@ -931,6 +994,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
 async fn run_local_or_archive_fleet_scan(
     target_path: &str,
     cutoff_date: &str,
+    cutoff_time: Option<&str>,
     run_stamp: &str,
     output_dir: &str,
     report_prefix: &str,
@@ -939,17 +1003,34 @@ async fn run_local_or_archive_fleet_scan(
     threads: Option<usize>,
     verbose: bool,
     custom_sql: Option<&str>,
+    latest_only: bool,
 ) -> Result<()> {
     let cutoff_naive = chrono::NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let cutoff_dt = cutoff_time.and_then(|t| {
+        chrono::NaiveDateTime::parse_from_str(
+            &format!("{} {}", cutoff_date, t),
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .ok()
+    });
     let items = resolve_source_items_with_cutoff(target_path, Some(cutoff_naive))?;
-    let items = filter_items_by_min_date(items, cutoff_naive);
+    let items = match cutoff_dt {
+        Some(cdt) => filter_items_by_datetime(items, cdt),
+        None => filter_items_by_min_date(items, cutoff_naive),
+    };
+    let items = if latest_only {
+        keep_latest_log_item(items)
+    } else {
+        items
+    };
     if items.is_empty() {
         anyhow::bail!("No log files on/after {} in {}", cutoff_date, target_path);
     }
     let files_scanned = items.len();
     let pre_filter = ScanPreFilter {
         min_date: Some(cutoff_date.to_string()),
+        min_time: cutoff_time.map(|t| t.to_string()),
         status_prefix: if custom_sql.is_none() {
             Some(status_prefix.to_string())
         } else {
@@ -969,9 +1050,9 @@ async fn run_local_or_archive_fleet_scan(
         )
         .await?;
     let cols = engine.table_columns("logs").await;
-    let sql = custom_sql
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| build_multi_format_error_sql(&cols, status_prefix, cutoff_date));
+    let sql = custom_sql.map(|s| s.to_string()).unwrap_or_else(|| {
+        build_multi_format_error_sql(&cols, status_prefix, cutoff_date, cutoff_time)
+    });
     let batches = engine.query(&sql).await?;
 
     let mut custom_cols: Vec<String> = Vec::new();
@@ -1905,7 +1986,12 @@ fn parse_stack_input_format(server_type: &str) -> InputFormat {
 
 /// Builds a universal SQL query for `lpr fleet` that adapts automatically to IIS W3C (`sc_status`),
 /// Nginx/Apache/Tomcat (`status`), AWS ALB (`elb_status_code`), S3 (`http_status`), or Syslog/HAProxy (`message`).
-fn build_multi_format_error_sql(cols: &[String], status_prefix: &str, cutoff_date: &str) -> String {
+fn build_multi_format_error_sql(
+    cols: &[String],
+    status_prefix: &str,
+    cutoff_date: &str,
+    cutoff_time: Option<&str>,
+) -> String {
     let safe_status: String = status_prefix
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
@@ -1916,10 +2002,24 @@ fn build_multi_format_error_sql(cols: &[String], status_prefix: &str, cutoff_dat
         .filter(|c| c.is_ascii_digit() || *c == '-')
         .collect();
     let has = |c: &str| cols.iter().any(|x| x.eq_ignore_ascii_case(c));
+    let date_clause = match (cutoff_time, has("time")) {
+        (Some(t), true) => {
+            let safe_t: String = t
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == ':')
+                .collect();
+            format!(
+                "(date > '{d}' OR (date = '{d}' AND time >= '{t}'))",
+                d = safe_cutoff,
+                t = safe_t
+            )
+        }
+        _ => format!("date >= '{}'", safe_cutoff),
+    };
     if has("sc_status") && has("date") {
         format!(
-            "SELECT * FROM logs WHERE sc_status LIKE '{}%' AND date >= '{}' ORDER BY date, time",
-            sp, safe_cutoff
+            "SELECT * FROM logs WHERE sc_status LIKE '{}%' AND {} ORDER BY date, time",
+            sp, date_clause
         )
     } else if has("status") {
         format!("SELECT * FROM logs WHERE CAST(status AS VARCHAR) LIKE '{}%'", sp)
@@ -2044,6 +2144,8 @@ async fn scan_linux_server_via_ssh(
     threads: Option<usize>,
     verbose: bool,
     custom_sql: Option<&str>,
+    hours: Option<i64>,
+    latest_only: bool,
 ) -> Result<(
     Vec<FleetErrorRow>,
     Option<(Vec<String>, Vec<Vec<String>>)>,
@@ -2081,12 +2183,25 @@ async fn scan_linux_server_via_ssh(
     let quoted_dirs: Vec<String> = search_dirs.iter().map(|d| posix_single_quote(d)).collect();
     let dirs_arg = search_dirs.join(" ");
 
-    // Build a POSIX-quoted remote shell command that prevents command injection
-    let remote_cmd = format!(
-        "find {} -maxdepth 2 -type f \\( -name '*.log' -o -name '*.log.1' -o -name '*access*.gz' \\) -mtime -{} 2>/dev/null | head -n 50 | xargs -r zcat -f 2>/dev/null",
-        quoted_dirs.join(" "),
-        days.clamp(1, 3650)
-    );
+    // Build a POSIX-quoted remote shell command that prevents command injection.
+    // --hours uses -mmin (minute granularity); --latest sorts by mtime and keeps only the newest file.
+    let find_time = match hours {
+        Some(h) => format!("-mmin -{}", (h.max(1) * 60).min(5_256_000)),
+        None => format!("-mtime -{}", days.clamp(1, 3650)),
+    };
+    let remote_cmd = if latest_only {
+        format!(
+            "find {} -maxdepth 2 -type f \\( -name '*.log' -o -name '*.log.1' -o -name '*access*.gz' \\) {} -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- | xargs -r zcat -f 2>/dev/null",
+            quoted_dirs.join(" "),
+            find_time
+        )
+    } else {
+        format!(
+            "find {} -maxdepth 2 -type f \\( -name '*.log' -o -name '*.log.1' -o -name '*access*.gz' \\) {} 2>/dev/null | head -n 50 | xargs -r zcat -f 2>/dev/null",
+            quoted_dirs.join(" "),
+            find_time
+        )
+    };
 
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o")
@@ -2145,7 +2260,7 @@ async fn scan_linux_server_via_ssh(
     let cols = engine.table_columns("logs").await;
     let sql = custom_sql
         .map(|s| s.to_string())
-        .unwrap_or_else(|| build_multi_format_error_sql(&cols, status_prefix, cutoff_date));
+        .unwrap_or_else(|| build_multi_format_error_sql(&cols, status_prefix, cutoff_date, None));
     let batches = engine.query(&sql).await?;
     if custom_sql.is_some() {
         let mut gcols = Vec::new();
