@@ -207,6 +207,7 @@ pub struct FleetScanConfig {
     pub server_numbers: Option<String>,
     pub local_path: Option<String>,
     pub status_prefix: Option<String>,
+    pub custom_sql: Option<String>,
     pub threads: Option<usize>,
     pub verbose: bool,
 }
@@ -375,6 +376,9 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     if let Some(ref st) = req.status_prefix {
         profile.status_prefix = Some(st.clone());
     }
+    if let Some(ref q) = req.custom_sql {
+        profile.default_sql = Some(q.clone());
+    }
     if let Some(ref o) = req.output_dir {
         profile.output_dir = Some(o.clone());
     }
@@ -518,6 +522,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         .status_prefix
         .clone()
         .unwrap_or_else(|| "5".to_string());
+    let custom_sql = profile.default_sql.clone();
     let output_dir = profile
         .output_dir
         .clone()
@@ -540,10 +545,14 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     println!("================================================================================");
     println!(" {SYM_GLOBE} LPR MULTI-SERVER FLEET SCANNER (Profile: `{}`)", active_profile_name);
     println!(
-        " {SYM_CAL} Days: {} (Cutoff >= {}) | Status: {}xx | Threads: {}",
+        " {SYM_CAL} Days: {} (Cutoff >= {}) | {} | Threads: {}",
         days,
         cutoff_date,
-        status_prefix,
+        if custom_sql.is_some() {
+            "Mode: Custom SQL".to_string()
+        } else {
+            format!("Status: {}xx", status_prefix)
+        },
         threads
             .map(|t| t.to_string())
             .unwrap_or_else(|| "Auto (All Cores)".to_string())
@@ -562,6 +571,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             days,
             threads,
             verbose,
+            custom_sql.as_deref(),
         )
         .await;
     }
@@ -608,6 +618,8 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     let mut all_errors: Vec<FleetErrorRow> = Vec::new();
     let mut summaries: Vec<FleetServerSummary> = Vec::new();
     let mut failed_servers: Vec<String> = Vec::new();
+    let mut custom_cols: Vec<String> = Vec::new();
+    let mut custom_rows: Vec<Vec<String>> = Vec::new();
 
     #[cfg(windows)]
     let resolved_smb_secret = if profile.auth_user.is_some() {
@@ -629,10 +641,11 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 days,
                 threads,
                 verbose,
+                custom_sql.as_deref(),
             )
             .await
             {
-                Ok((rows, files_count, scanned_info)) => {
+                Ok((rows, generic, files_count, scanned_info)) => {
                     let first_err = rows
                         .first()
                         .map(|r| format!("{} {}", r.date, r.time))
@@ -641,18 +654,19 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                         .last()
                         .map(|r| format!("{} {}", r.date, r.time))
                         .unwrap_or_default();
+                    let row_count = generic.as_ref().map(|g| g.1.len()).unwrap_or(rows.len());
                     println!(
                         "  {SYM_OK}  [SSH] {:14} ({:12}) -> {:>5} match(es) across {:>4} remote file(s)",
                         srv.name,
                         srv.ip,
-                        rows.len(),
+                        row_count,
                         files_count
                     );
                     summaries.push(FleetServerSummary {
                         server_name: srv.name.clone(),
                         server_ip: srv.ip.clone(),
                         success: true,
-                        total_errors: rows.len(),
+                        total_errors: row_count,
                         log_files_scanned: files_count,
                         engine: "lpr-ssh-linux".to_string(),
                         first_error: first_err,
@@ -660,6 +674,12 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                         scanned_paths: scanned_info,
                         error_message: String::new(),
                     });
+                    if let Some((cols, grows)) = generic {
+                        if custom_cols.is_empty() {
+                            custom_cols = cols;
+                        }
+                        custom_rows.extend(grows);
+                    }
                     all_errors.extend(rows);
                 }
                 Err(e) => {
@@ -784,7 +804,11 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         }
         let pre_filter = ScanPreFilter {
             min_date: Some(cutoff_date.clone()),
-            status_prefix: Some(status_prefix.clone()),
+            status_prefix: if custom_sql.is_some() {
+                None
+            } else {
+                Some(status_prefix.clone())
+            },
         };
         let engine = LogEngine::with_options(threads, verbose);
         let input_fmt = parse_stack_input_format(&server_type);
@@ -802,10 +826,22 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         {
             Ok(detected_fmt) => {
                 let cols = engine.table_columns("logs").await;
-                let sql = build_multi_format_error_sql(&cols, &status_prefix, &cutoff_date);
+                let sql = custom_sql.clone().unwrap_or_else(|| {
+                    build_multi_format_error_sql(&cols, &status_prefix, &cutoff_date)
+                });
                 match engine.query(&sql).await {
                     Ok(batches) => {
-                        let rows = extract_fleet_rows(&batches, &srv.name, &srv.ip);
+                        let (rows, row_count) = if custom_sql.is_some() {
+                            let grows =
+                                extract_generic_rows(&batches, &mut custom_cols, &srv.name, &srv.ip);
+                            let n = grows.len();
+                            custom_rows.extend(grows);
+                            (Vec::new(), n)
+                        } else {
+                            let rows = extract_fleet_rows(&batches, &srv.name, &srv.ip);
+                            let n = rows.len();
+                            (rows, n)
+                        };
                         let first_err = rows
                             .first()
                             .map(|r| format!("{} {}", r.date, r.time))
@@ -819,7 +855,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                             srv.name,
                             srv.ip,
                             detected_fmt,
-                            rows.len(),
+                            row_count,
                             files_count,
                             total_files
                         );
@@ -827,7 +863,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                             server_name: srv.name.clone(),
                             server_ip: srv.ip.clone(),
                             success: true,
-                            total_errors: rows.len(),
+                            total_errors: row_count,
                             log_files_scanned: files_count,
                             engine: format!("lpr-{:?}", detected_fmt),
                             first_error: first_err,
@@ -883,6 +919,11 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         &all_errors,
         &summaries,
         &failed_servers,
+        if custom_sql.is_some() {
+            Some((&custom_cols, &custom_rows))
+        } else {
+            None
+        },
     )
 }
 
@@ -897,6 +938,7 @@ async fn run_local_or_archive_fleet_scan(
     days: i64,
     threads: Option<usize>,
     verbose: bool,
+    custom_sql: Option<&str>,
 ) -> Result<()> {
     let cutoff_naive = chrono::NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Utc::now().date_naive());
@@ -908,7 +950,11 @@ async fn run_local_or_archive_fleet_scan(
     let files_scanned = items.len();
     let pre_filter = ScanPreFilter {
         min_date: Some(cutoff_date.to_string()),
-        status_prefix: Some(status_prefix.to_string()),
+        status_prefix: if custom_sql.is_none() {
+            Some(status_prefix.to_string())
+        } else {
+            None
+        },
     };
     let engine = LogEngine::with_options(threads, verbose);
     let detected_fmt = engine
@@ -923,9 +969,22 @@ async fn run_local_or_archive_fleet_scan(
         )
         .await?;
     let cols = engine.table_columns("logs").await;
-    let sql = build_multi_format_error_sql(&cols, status_prefix, cutoff_date);
+    let sql = custom_sql
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| build_multi_format_error_sql(&cols, status_prefix, cutoff_date));
     let batches = engine.query(&sql).await?;
-    let all_errors = extract_fleet_rows(&batches, "LOCAL-SERVER", "127.0.0.1");
+
+    let mut custom_cols: Vec<String> = Vec::new();
+    let mut custom_rows: Vec<Vec<String>> = Vec::new();
+    let mut all_errors: Vec<FleetErrorRow> = Vec::new();
+    let row_count;
+    if custom_sql.is_some() {
+        custom_rows = extract_generic_rows(&batches, &mut custom_cols, "LOCAL-SERVER", "127.0.0.1");
+        row_count = custom_rows.len();
+    } else {
+        all_errors = extract_fleet_rows(&batches, "LOCAL-SERVER", "127.0.0.1");
+        row_count = all_errors.len();
+    }
 
     let first_err = all_errors
         .first()
@@ -948,7 +1007,7 @@ async fn run_local_or_archive_fleet_scan(
         server_name: srv_name,
         server_ip: srv_ip,
         success: true,
-        total_errors: all_errors.len(),
+        total_errors: row_count,
         log_files_scanned: files_scanned,
         engine: format!("lpr-{:?}", detected_fmt),
         first_error: first_err,
@@ -968,7 +1027,49 @@ async fn run_local_or_archive_fleet_scan(
         &all_errors,
         &summaries,
         &[],
+        if custom_sql.is_some() {
+            Some((&custom_cols, &custom_rows))
+        } else {
+            None
+        },
     )
+}
+
+fn extract_generic_rows(
+    batches: &[arrow::record_batch::RecordBatch],
+    col_names: &mut Vec<String>,
+    srv_name: &str,
+    srv_ip: &str,
+) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    if col_names.is_empty() {
+        if let Some(b) = batches.first() {
+            *col_names = b
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+        }
+    }
+    if let Ok(val) = batches_to_json_value(batches) {
+        if let Some(arr) = val.as_array() {
+            for obj in arr {
+                let mut rec = Vec::with_capacity(col_names.len() + 2);
+                rec.push(srv_name.to_string());
+                rec.push(srv_ip.to_string());
+                for c in col_names.iter() {
+                    rec.push(match obj.get(c.as_str()) {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(serde_json::Value::Null) | None => String::new(),
+                        Some(v) => v.to_string(),
+                    });
+                }
+                out.push(rec);
+            }
+        }
+    }
+    out
 }
 
 fn extract_fleet_rows(
@@ -1110,6 +1211,7 @@ fn extract_fleet_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn write_fleet_reports(
     output_dir: &str,
     report_prefix: &str,
@@ -1121,6 +1223,7 @@ fn write_fleet_reports(
     all_errors: &[FleetErrorRow],
     summaries: &[FleetServerSummary],
     failed_servers: &[String],
+    custom_detail: Option<(&[String], &[Vec<String>])>,
 ) -> Result<()> {
     let safe_prefix: String = report_prefix
         .chars()
@@ -1138,8 +1241,20 @@ fn write_fleet_reports(
 
     {
         let mut wtr = csv::Writer::from_path(&detail_csv)?;
-        for row in all_errors {
-            wtr.serialize(row)?;
+        match custom_detail {
+            Some((cols, rows)) => {
+                let mut header = vec!["ServerName".to_string(), "ServerIP".to_string()];
+                header.extend(cols.iter().cloned());
+                wtr.write_record(&header)?;
+                for r in rows {
+                    wtr.write_record(r)?;
+                }
+            }
+            None => {
+                for row in all_errors {
+                    wtr.serialize(row)?;
+                }
+            }
         }
         wtr.flush()?;
     }
@@ -1162,7 +1277,9 @@ fn write_fleet_reports(
         servers_requested,
         succeeded,
         failed_servers.len(),
-        all_errors.len(),
+        custom_detail
+            .map(|(_, rows)| rows.len())
+            .unwrap_or(all_errors.len()),
         detail_csv.to_string_lossy(),
         summary_csv.to_string_lossy(),
         failed_servers.join(",")
@@ -1171,7 +1288,14 @@ fn write_fleet_reports(
 
     println!("--------------------------------------------------------------------------------");
     println!(" {SYM_DONE} Fleet Scan Complete!");
-    println!(" {SYM_CHART} Total {}xx Matches : {}", status_prefix, all_errors.len());
+    let total_matches = custom_detail
+        .map(|(_, rows)| rows.len())
+        .unwrap_or(all_errors.len());
+    if custom_detail.is_some() {
+        println!(" {SYM_CHART} Total Matches    : {}", total_matches);
+    } else {
+        println!(" {SYM_CHART} Total {}xx Matches : {}", status_prefix, total_matches);
+    }
     println!(" {SYM_FILE} Detail CSV        : {}", detail_csv.to_string_lossy());
     println!(" {SYM_LIST} Summary CSV       : {}", summary_csv.to_string_lossy());
     println!(" {SYM_NOTE} Manifest File     : {}", manifest_txt.to_string_lossy());
@@ -1919,7 +2043,13 @@ async fn scan_linux_server_via_ssh(
     days: i64,
     threads: Option<usize>,
     verbose: bool,
-) -> Result<(Vec<FleetErrorRow>, usize, String)> {
+    custom_sql: Option<&str>,
+) -> Result<(
+    Vec<FleetErrorRow>,
+    Option<(Vec<String>, Vec<Vec<String>>)>,
+    usize,
+    String,
+)> {
     let target_host = if !srv.ip.is_empty() {
         srv.ip.trim()
     } else {
@@ -1981,7 +2111,12 @@ async fn scan_linux_server_via_ssh(
     }
 
     if out.stdout.is_empty() {
-        return Ok((Vec::new(), 0, format!("ssh://{}:{}", ssh_target, dirs_arg)));
+        return Ok((
+            Vec::new(),
+            None,
+            0,
+            format!("ssh://{}:{}", ssh_target, dirs_arg),
+        ));
     }
 
     let safe_srv_tag: String = srv
@@ -2008,8 +2143,21 @@ async fn scan_linux_server_via_ssh(
     }
 
     let cols = engine.table_columns("logs").await;
-    let sql = build_multi_format_error_sql(&cols, status_prefix, cutoff_date);
+    let sql = custom_sql
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| build_multi_format_error_sql(&cols, status_prefix, cutoff_date));
     let batches = engine.query(&sql).await?;
+    if custom_sql.is_some() {
+        let mut gcols = Vec::new();
+        let grows = extract_generic_rows(&batches, &mut gcols, &srv.name, &srv.ip);
+        let _ = fs::remove_file(&tmp_path);
+        return Ok((
+            Vec::new(),
+            Some((gcols, grows)),
+            1,
+            format!("ssh://{}:{}", ssh_target, dirs_arg),
+        ));
+    }
     let mut rows = extract_fleet_rows(&batches, &srv.name, &srv.ip);
     for r in &mut rows {
         if r.log_file.starts_with("lpr_ssh_") {
@@ -2018,5 +2166,10 @@ async fn scan_linux_server_via_ssh(
     }
     let _ = fs::remove_file(&tmp_path);
 
-    Ok((rows, 1, format!("ssh://{}:{}", ssh_target, dirs_arg)))
+    Ok((
+        rows,
+        None,
+        1,
+        format!("ssh://{}:{}", ssh_target, dirs_arg),
+    ))
 }

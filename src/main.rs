@@ -24,17 +24,20 @@ use parsers::{resolve_source_items, InputFormat};
 use sinks::{infer_output_format_from_path, write_batches, write_batches_with_options, OutputFormat};
 use std::io::{IsTerminal, Write};
 
-pub const LPR_VERSION: &str = "1.4.0";
+pub const LPR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn get_ascii_banner() -> &'static str {
-    r#"   ___             ___                         
-  / / |___  _ __  / _ \___ _ _ _ ___ ___ _ _   
- / /| '_ \ '_ \/ /_\/ _ \ '_| '_/ -_) _ \ '_|  
-/_/ |_.__/ .__/\__/\___/_| |_|  \___|___/_|    
-         |_|   v1.4.0 — Multi-Threaded Rust SQL Log Engine & Security Auditor
+pub fn get_ascii_banner() -> String {
+    format!(
+        r#"   ___             ___
+  / / |___  _ __  / _ \___ _ _ _ ___ ___ _ _
+ / /| '_ \ '_ \/ /_\/ _ \ '_| '_/ -_) _ \ '_|
+/_/ |_.__/ .__/\__/\___/_| |_|  \___|___/_|
+         |_|   v{} — Multi-Threaded Rust SQL Log Engine & Security Auditor
                Powered by Apache Arrow 53, DataFusion 42 & Rayon Parallel Engine
                Made using vibe coding by Sunil Warrier
-================================================================================"#
+================================================================================"#,
+        LPR_VERSION
+    )
 }
 
 #[derive(Parser)]
@@ -351,9 +354,13 @@ enum Commands {
         #[arg(short = 'f', long = "local-path", value_name = "PATH_OR_ZIP")]
         local_path: Option<String>,
 
-        /// HTTP status prefix to scan for (default "5" for 500-599 errors; use "4" for 4xx)
+        /// HTTP status prefix to scan for (default "5" for 500-599 errors; use "4" for 4xx; ignored when --sql is given)
         #[arg(long = "status-prefix")]
         status_prefix: Option<String>,
+
+        /// Run an arbitrary LPR SQL query on every server instead of the built-in error scan (queries the `logs` table)
+        #[arg(long = "sql", value_name = "SQL_QUERY")]
+        sql: Option<String>,
     },
 
     /// Manage saved configuration profiles in lpr.config.json (list, show, save, set-default)
@@ -858,6 +865,7 @@ async fn main() -> Result<()> {
             server_numbers,
             local_path,
             status_prefix,
+            sql,
         }) => {
             let cfg = fleet::FleetScanConfig {
                 cfg_file_path: cli.cfg_file.clone(),
@@ -888,6 +896,7 @@ async fn main() -> Result<()> {
                 server_numbers,
                 local_path,
                 status_prefix,
+                custom_sql: sql,
                 threads: cli.threads,
                 verbose: cli.verbose,
             };
