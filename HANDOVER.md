@@ -1,149 +1,138 @@
-# LPR (Log Parser Rust) — Project Handover & Roadmap Document
+# LPR (Log Parser Rust) — Project Handover & Complete Architecture Guide
 
-**Date:** 2026-10-15  
-**Version:** 1.0.0  
-**Project:** Modern Rust SQL Log Parser & Security Auditor  
-**Location:** `/Users/sunil/Development/Personal/lpr`
-
----
-
-## 1. Executive Summary & Current State
-
-`lpr` is a high-performance, single-binary log engine and security auditor written in Rust, powered by **Apache Arrow (53.0)** and **DataFusion (42.0)**. It is designed as a modern, cross-platform replacement for legacy tools like Microsoft Log Parser 2.2, GoAccess, and log-tailing scripts.
-
-### What is Currently Implemented & Tested
-1. **Vectorized ANSI SQL Engine**: Executes complex SQL queries, aggregations (`GROUP BY`), joins, and filters over local and globbed log files in parallel.
-2. **20+ Log Formats**: Auto-detects and parses W3C/IIS, Nginx, Syslog/Auth.log, FortiGate Firewall KV, Cisco Config (.cfg), Cisco ASA, AWS S3/VPC/ALB, Azure Blob, GCP Logging, CEF, JSON/NDJSON, CSV, TSV, Excel (.xlsx), Parquet, and EVTX.
-3. **Cyber & Security UDFs**:
-   - `detect_threat(col)`: Real-time detection of SQL Injection, XSS, Log4Shell, RCE, Path Traversal (LFI), and SSRF.
-   - `ip_in_cidr(ip, 'net/mask')`: IPv4/IPv6 subnet inclusion.
-   - `shannon_entropy(col)`: Entropy anomaly detection for base64 payloads and DGA domains.
-   - `mask_pii(col)`: GDPR/HIPAA email redaction.
-   - `cluster_template(col)`: Drain log clustering (normalizes variables to `<*>`).
-   - `url_decode(col)` & `parse_ua(col)`: URI percent decoding and User-Agent classifier.
-4. **Automated Security Auditor (`lpr audit`)**: Rules for CIS Cisco ACL checks, Type 7 weak passwords, OWASP web attacks, and S3 modifications.
-5. **Multi-Interface Support**:
-   - **CLI**: Standard headless querying, stdout pipes, and export sinks (`table`, `json`, `ndjson`, `csv`, `markdown`, `sql`, `parquet`).
-   - **Web Studio (`lpr serve`)**: Embedded Axum/Tokio web server running at `http://127.0.0.1:8080` with dark-mode SOC analytics dashboard, query presets, live table filtering, and security audit tabs.
-   - **TUI Dashboard (`lpr tui`)**: Ratatui/crossterm terminal UI.
-   - **AI Agent API (`lpr mcp`)**: Model Context Protocol stdio server for LLM integration.
-6. **Cross-Compiled Binaries**:
-   - macOS (native): `target/release/lpr`
-   - Windows 64-bit (native standalone, zero WebView2 dependencies): `dist/lpr.exe` (and `target/x86_64-pc-windows-gnu/release/lpr.exe`).
+**Date:** 2026-10-16
+**Version:** 1.4.0
+**Project:** Modern Multi-Threaded Rust SQL Log Engine, Fleet Error Scanner & Security Auditor
+**Author / Attribution:** Made using vibe coding by Sunil Warrier
+**License:** MIT OR The Unlicense (Open-Source — anyone can modify and use for any purpose)
 
 ---
 
-## 2. Windows IIS Error Analysis: "stream did not contain valid UTF-8"
+## 1. Executive Summary
 
-### Symptom
-When running against Windows IIS logs:
-```cmd
-D:\emLogs\HOB2014\W3SVC4>d:\emScripts\lpr.exe -f "*.log" "select * FROM logs WHERE sc_status LIKE '5%'"
-Error: stream did not contain valid UTF-8
+`lpr` is a high-performance, single-binary SQL log parser, multi-server fleet scanner, and cybersecurity auditor written in Rust, powered by **Apache Arrow (53.0)**, **DataFusion (42.0)**, and **Rayon (1.10)**. It is a complete, cross-platform replacement and superset of **Microsoft Log Parser 2.2**, **GoAccess**, **lnav**, and custom PowerShell/Bash log-scraping scripts.
+
+Benchmark: parses and queries **1.05 GB of IIS logs (2.55M lines across 11 files inside a `.zip`) in ~0.6 s (~1,700+ MB/s)** on a 14-core Apple Silicon host.
+
+---
+
+## 2. Repository Layout (all paths relative to repo root)
+
+```
+├── Cargo.toml              # v1.4.0, authors=["Sunil Warrier"], license = "MIT OR Unlicense"
+├── LICENSE                 # Dual MIT / Unlicense — "Made using vibe coding by Sunil Warrier"
+├── README.md               # GitHub landing page
+├── HANDOVER.md             # This file
+├── PROJECT_CONTEXT.md      # Developer spec & next-agent transfer notes
+├── AGENTS.md               # Build rules (incremental vs dist)
+├── .gitignore              # Excludes /target, Cargo.lock, *.zip (except samples/**), lpr.config.json, samples_client_local/
+├── docs/
+│   ├── SAMPLE_QUERIES.md   # 200+ ready-to-run SQL recipes across all log types (22 sections)
+│   └── EXPECTED_OUTPUTS.md # Sample output shapes for every sink/format/mode
+├── samples/                # PUBLIC, synthetic-only logs — 26 files across 18 categories:
+│   ├── iis/                #   u_extend01.log, u_extend02.log, multi_site_logs.zip
+│   ├── iis_smtp/           #   u_ex260101.log (MAIL/RCPT/EHLO/AUTH/VRFY commands)
+│   ├── nginx/              #   access.log (combined format incl. SQLi/LFI/502 rows)
+│   ├── apache/             #   access.log
+│   ├── caddy/              #   caddy.json (JSON access logs)
+│   ├── haproxy/            #   haproxy.log
+│   ├── syslog/             #   auth.log (SSH brute force, sudo)
+│   ├── firewall/           #   firewall.log (key=value pairs, allowed/denied)
+│   ├── cisco_asa/          #   asa.log (%ASA-4/6 events)
+│   ├── cisco_config/       #   router.cfg (interfaces, ACLs, SNMP)
+│   ├── cef/                #   cef.log
+│   ├── aws/                #   alb_access.log, vpc_flow.log, s3_access.log
+│   ├── azure/              #   activity.json
+│   ├── gcp/                #   audit.json
+│   ├── evtx/               #   security_events.json (EventID 4624/4625)
+│   ├── json_logs/          #   events.ndjson, app.log (key=value text)
+│   ├── csv_logs/           #   events.csv, events.tsv
+│   ├── gz_logs/            #   nginx_access.log.gz, u_extend01.log.gz
+│   └── zstd_logs/          #   access.log.zst
+├── samples_client_local/   # GITIGNORED — local-only client test data, never publish
+├── tests/smoke_test.sh     # 10-suite smoke test
+├── dist/                   # lpr.exe (Windows x86_64), lpr (macOS arm64), lpr.psm1, LprClient.cs
+└── src/
+    ├── main.rs             # Clap CLI, LogParser colon-flag preprocessor, Linux flags, banner, sdk, help-full
+    ├── engine.rs           # DataFusion SessionContext, MemTable partitioning, SQL normalizer, intents
+    ├── parsers.rs          # Rayon-parallel W3C/regex/raw parsers; .zip/.gz/.zst; UTF-16/Win-1252 decoding
+    ├── fleet.rs            # Fleet scanner: SMB+IIS applicationHost.config, SSH for Linux; lpr.config.json profiles
+    ├── udfs.rs             # 27 scalar UDFs (14 LP2.2 + 9 cyber/email + 4 time-series/utility)
+    ├── audit.rs            # Multi-rule audit reports (IIS, SMTP, Nginx, Cisco, Firewall, AWS, cloud)
+    ├── server.rs           # Axum REST API (GET/POST /v1/query, /v1/audit, /v1/browse, /v1/schema, /metrics)
+    ├── ui.html             # lpr Studio web UI (file browser, Tab autocomplete, intent chips, help)
+    ├── tui.rs              # Ratatui TUI (F1 help, F2 intents, F3 browser, Tab complete)
+    ├── mcp.rs              # MCP JSON-RPC stdio server (query_logs, audit_logs, suggest_queries)
+    ├── gui.rs              # Tao+Wry native window (feature="gui")
+    ├── sinks.rs            # Table, CHART bars, vertical cards, CSV/TSV/JSON/NDJSON/XML/Markdown/SQL/Parquet
+    ├── hooks.rs            # Webhook + subprocess triggers
+    └── checkpoint.rs       # Byte-offset checkpoint store for --tail
 ```
 
-### Root Cause
-1. On Windows Server (especially older or localized IIS installations like IIS 7.5, 8.5, 10.0), IIS W3C log files are often generated in:
-   - **UTF-16LE with BOM** (`0xFF 0xFE`), OR
-   - **Windows-1252 / ANSI / ISO-8859-1** (Latin-1).
-2. In Rust, standard `BufRead::lines()` strictly requires valid UTF-8 byte sequences. When encountering non-UTF-8 bytes (such as high-order bytes `>= 0x80` in Windows-1252 or 2-byte UTF-16 code units), Rust returns an `io::Error: stream did not contain valid UTF-8`.
+---
 
-### Planned Solution (To Be Implemented)
-`encoding_rs` is already a dependency in `Cargo.toml`. The reader in `src/parsers.rs` must be upgraded to:
-1. Detect UTF-16LE / UTF-16BE BOM at the start of the file.
-2. If UTF-16 is detected, decode using `encoding_rs::UTF_16LE.decode(&bytes)`.
-3. If not UTF-16, read lines with `read_until(b'\n')` and apply lossy UTF-8 conversion: `String::from_utf8_lossy(&buf)` or `encoding_rs::WINDOWS_1252.decode(&bytes)`.
-4. This guarantees that **no file ever fails with a UTF-8 error**, regardless of Windows locale, BOM, or encoding.
+## 3. Feature Matrix (v1.4.0)
+
+### Parsing / Ingestion
+- **Formats**: IIS W3C, IIS SMTP (SMTPSVC), Nginx, Apache/httpd, Caddy JSON, HAProxy, Syslog, Firewall key=value, Cisco ASA, Cisco config, CEF, AWS ALB / VPC Flow / S3, Azure activity, GCP audit, generic JSON/NDJSON, CSV/TSV, Excel (.xlsx/.xls via calamine), Parquet, EVTX (.evtx binary or EVTX-as-JSON), raw line, custom regex.
+- **Sources**: file path, glob (`*.log`), directory (recursive), semicolon-separated multi-path, `.zip` (parallel per-entry decompression), `.gz`, `.zst`, stdin (`-` / `stdin` / piped).
+- **Encodings**: UTF-16LE/BE BOM, UTF-8 BOM, Windows-1252, Latin-1, lossy fallback — never fails on `stream did not contain valid UTF-8`.
+- **Virtual columns**: `log_filename`, `log_row` (LogParser `LogFilename`/`LogRow` aliases).
+- **W3C mid-file `#Fields:` rotations** handled; scans up to 50 lines for the header; falls back to standard IIS column layout.
+
+### SQL Engine (DataFusion 42)
+- Full ANSI SQL: `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`/`TOP N`, `JOIN`, `UNION`, `DISTINCT`, `CASE`, `CAST`, subqueries, CTEs (`WITH`), window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, `PERCENT_RANK`, running `COUNT() OVER`).
+- **Log Parser 2.2 surface**: `-i:`/`-o:` colon flags, bracketed/hyphenated columns (`[sc-status]`, `cs(User-Agent)`), `FROM 'path-or-glob'`, `INTO 'file'`, `file:query.sql`, `-q`, `-stats`, `-e`, `-iw`, `-rtp`.
+- **Time-series (KQL/KSQL-style) UDFs** added in v1.4.0:
+  - `time_bucket(date, time, minutes)` → `"YYYY-MM-DD HH:MM"` truncated bucket (tumbling-window equivalent).
+  - `date_diff_days(d1, d2)` → integer day delta.
+  - `geoip_scope(ip)` → `PRIVATE` / `PUBLIC` / `TEST-NET`.
+  - `url_path(url)` → strips query string for page-level grouping.
+- **Cyber UDFs**: `detect_threat` (SQLi/XSS/LFI/RCE/SSRF/scanner), `ip_in_cidr`, `shannon_entropy`, `mask_pii`, `cluster_template` (Drain), `url_decode`, `parse_ua`, `extract_email`, `extract_domain`.
+- **LP2.2 UDFs**: `extract_token`, `extract_prefix`, `extract_suffix`, `extract_filename`, `extract_path`, `extract_extension`, `win32_error_description`, `reversedns`, `to_timestamp`, `index_of`, `strlen`, `to_uppercase`, `to_lowercase`, `to_int`, `to_real`.
+
+### Fleet Scanner (`lpr fleet`)
+- `servers.csv` (Name,IP,Enabled) or `--host-pattern "web-{02}"` + `--server-numbers "1-12"`.
+- **Windows/IIS**: expands `D:\path\{site}` → `\\{server}\d$\...`; IIS auto-discovery parses `\\{server}\c$\Windows\System32\inetsrv\config\applicationHost.config` for `<site name|id>` → `<logFile directory>` → `W3SVC{id}`.
+- **Linux (--ssh)**: streams `find /var/log/nginx|apache2|httpd|caddy|tomcat ... -mtime -N | xargs zcat -f` over SSH (BatchMode, ConnectTimeout, `-i key`, `-p port`), then parses locally — no agent needed on the host.
+- Writes three artifacts per run: `<prefix>-<ts>.csv` (detail), `-Summary-`, `-Manifest-`.
+- `lpr.config.json` profiles: `--save-profile NAME` persists servers/paths/threads/days/paths; `--profile NAME` reuses; `lpr config` lists/sets default.
+
+### Interfaces
+- CLI (rich banner, `-V` verbose, `--log-file`, `--max-width`, `-G` vertical).
+- `lpr serve` → REST + Studio UI (GET/POST `/v1/query`, `/v1/audit`, `/v1/browse`, `/v1/schema`, `/metrics`).
+- `lpr tui` → terminal UI; `lpr mcp` → MCP stdio server; `lpr gui` (feature-gated Tao+Wry).
+- `lpr sdk` → emits `dist/lpr.psm1` (PowerShell), `dist/LprClient.cs` (.NET), curl snippets.
 
 ---
 
-## 3. Microsoft Log Parser 2.2 Compatibility Roadmap
+## 4. Build Commands
 
-The user requested: *"can we have same syntax also working same as log parser"*.
+```bash
+# Fast dev build (incremental, jobs=4 cap):
+cargo build --release                     # ~10–15 s
 
-### Feature Parity Plan:
-| Microsoft Log Parser Syntax | Current `lpr` Status | Planned `lpr` Enhancement |
-| :--- | :--- | :--- |
-| `logparser "SELECT * FROM C:\logs\*.log WHERE sc-status >= 500"` | `-f` flag required: `lpr -f "*.log" "SELECT ..."` | **Auto-extract file/glob from SQL `FROM` clause**: If `FROM 'C:\logs\*.log'` or `FROM *.log` is provided without `-f`, automatically register that path as the `logs` table! |
-| `-i:IISW3C` or `-i:W3C` | `-i w3c` | Allow `-i:w3c`, `-i:iis`, `-i:iisw3c`, `-i:csv` (accept colon delimiter). |
-| Hyphenated column names: `[sc-status]`, `sc-status` | Normalized to `sc_status` | Auto-alias columns so both `sc_status` and `sc-status` (or `[sc-status]`) work cleanly in queries. |
-| `-o:CSV`, `-o:DATAGRID` | `-o csv`, `lpr gui` / `lpr serve` | Accept `-o:csv`, `-o:json`, `-o:table`. |
+# Windows cross-build (also fast — same profile):
+cargo build --release --target x86_64-pc-windows-gnu
+x86_64-w64-mingw32-strip -s target/x86_64-pc-windows-gnu/release/lpr.exe
+cp target/x86_64-pc-windows-gnu/release/lpr.exe dist/lpr.exe
 
----
+# macOS dist copy:
+cp target/release/lpr dist/lpr && cp target/release/lpr dist/lpr-macos-arm64
 
-## 4. Startup Banner & Help Experience
-
-The user requested:
-- *"how can we show a name of the software version in start"*
-- *"Can it show a help if no parameter"*
-
-### Planned Implementation:
-1. **Zero-Parameter Execution**:
-   - If `lpr` is run without any arguments (`args.len() == 1`), instead of printing an error, print a colorful ASCII / ANSI banner and quick-start examples, followed by `--help`.
-2. **Startup Banner**:
-   ```text
-      ___             ___                         
-     / / |___  _ __  / _ \___ _ _ _ ___ ___ _ _   
-    / /| '_ \ '_ \/ /_\/ _ \ '_| '_/ -_) _ \ '_|  
-   /_/ |_.__/ .__/\__/\___/_| |_|  \___|___/_|    
-            |_|       v1.0.0 (DataFusion 42 / Arrow 53)
-   ==============================================================
-   ```
-   - Automatically suppressed when output is piped (`!io::stdout().is_terminal()`), or when running in machine-mode (`-o json`, `-o ndjson`, `-o csv`), ensuring Unix pipeline compatibility.
+# Smoke test suite:
+bash tests/smoke_test.sh
+```
 
 ---
 
-## 5. Web & TUI File Explorer & Context-Aware Intent Assistant
+## 5. Known Constraints / Next-Agent Notes
 
-The user requested:
-- *"in tui web can we select the folder / file using file selector and option for full help and context aware / intent aware auto fill and help in cmd / cli also similar help"*
-
-### Architecture Design:
-1. **Web Studio Server-Side File Browser (`/v1/browse`)**:
-   - Add an endpoint `POST /v1/browse` taking `{ "path": "D:\\emLogs" }`.
-   - Returns child directories and matching log files (`.log`, `.txt`, `.cfg`, `.json`, `.csv`, `.gz`).
-   - Web UI (`src/ui.html`) gets an interactive file/folder picker modal so the user doesn't have to manually type long server paths.
-2. **Context-Aware Intent Auto-Fill**:
-   - When a file is selected (e.g. `u_ex*.log`), `lpr` sniffs the header `#Fields:`.
-   - The Web and TUI UI automatically presents relevant query chips:
-     - 🚨 *Find 500-level Server Errors (`sc_status LIKE '5%'`)*
-     - ⏱️ *Top 10 Slowest Requests (`ORDER BY time_taken DESC`)*
-     - 📉 *HTTP Substatus Breakdown (`sc_status, sc_substatus`)*
-     - 🌐 *Top 10 Client IPs (`GROUP BY c_ip`)*
-   - In CLI: Add `lpr suggest -f <file>` which inspects the schema and suggests 5 tailored SQL queries.
-
----
-
-## 6. What Else is Missing? (Gap Analysis)
-
-1. **Encoding Resilience (CRITICAL)**: Support Windows-1252, UTF-16LE, and mixed byte encodings seamlessly via `encoding_rs` and lossy fallback.
-2. **SQL `FROM '<path>'` Parser**: Detect file paths or globs directly inside SQL queries so `-f` is optional.
-3. **Directory Browsing in Web UI**: Add a visual file picker to `src/ui.html`.
-4. **Log Parser Function Compatibility**:
-   - `EXTRACT_TOKEN(str, index, delimiter)`
-   - `TO_TIMESTAMP(date, time)`
-   - `SUBSTR()`, `INDEX_OF()` aliases.
-5. **Streaming / Live Tail Mode (`-t` / `--tail`)**:
-   - Follow active log files in real-time (`tail -f`) and run SQL continuous queries / alerts.
-6. **Multi-File Memory Bounds**:
-   - For 100+ GB log directories, add chunked batch execution to keep peak RAM under a configurable threshold (e.g. `--max-memory 2GB`).
-
----
-
-## 7. Build & Cross-Compilation Cheat Sheet (For Reference Only)
-
-*Note: As instructed, do not execute builds right now.*
-
-- **Mac Native Build**:
-  ```bash
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cargo build --release
-  # Output: target/release/lpr
-  ```
-
-- **Windows 64-bit Standalone Cross-Compilation (from Mac)**:
-  ```bash
-  export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
-  cargo build --release --target x86_64-pc-windows-gnu
-  # Output: dist/lpr.exe (and target/x86_64-pc-windows-gnu/release/lpr.exe)
-  ```
+1. **`samples_client_local/` is gitignored** — it holds real client logs (Footasylum 1 GB zip). Never publish it. Public `samples/` contains ONLY synthetic RFC-5737 IPs (198.51.100.x, 203.0.113.x, 192.0.2.x).
+2. **SSH fleet mode** shells out to system `ssh` (BatchMode — key/agent auth only, no password prompts). Windows fleet mode uses direct `\\server\d$` file access (works when run on Windows with share permissions).
+3. **Linux remote scanning is pull-based** (SSH + zcat). A push-based mode (run `lpr` binary on the host) can be added via a `--remote-exec` flag — not yet implemented.
+4. `geoip_scope` is a coarse PRIVATE/PUBLIC/TEST-NET classifier — wire in a real MaxMind/GeoLite2 binary lookup (`maxminddb` crate) if full country/ASN data is wanted.
+5. `time_bucket` operates on W3C `date`+`time` string columns. For Nginx `time_local` (CLF `15/Oct/2026:10:03:15`), parse via `to_timestamp` or split helpers first.
+6. EVTX binary parsing uses the `evtx` crate; the `samples/evtx/security_events.json` file is EVTX-converted-to-JSON for demo only.
+7. Blume delivery `3b60b835-732c-40cb-9905-89002f9a1d95` is in Review phase; latest E2E run `7ec57c4b` passed 3/3 steps at revision `be69d68c+wip.fecbe52`.
+8. If porting to a new agent: start at `src/main.rs` (CLI surface) → `src/engine.rs` (DataFusion glue) → `src/parsers.rs` (format detection + parallel readers). All UDFs live in `src/udfs.rs`; audit rules in `src/audit.rs`; fleet logic + config profiles in `src/fleet.rs`.

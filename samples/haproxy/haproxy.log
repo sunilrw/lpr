@@ -1,0 +1,4 @@
+Oct 15 12:00:01 lb01 haproxy[1001]: 198.51.100.10:51234 [15/Oct/2026:12:00:01.001] https_frontend~ backend_web/web01 0/0/1/12/14 200 612 - - ---- 25/20/1/1/0 0/0 "GET /index.html HTTP/1.1"
+Oct 15 12:00:02 lb01 haproxy[1001]: 203.0.113.77:51235 [15/Oct/2026:12:00:02.001] https_frontend~ backend_web/web02 0/0/1/420/421 500 128 - - ---- 24/20/1/1/0 0/0 "GET /api/users HTTP/1.1"
+Oct 15 12:00:03 lb01 haproxy[1001]: 198.51.100.42:51236 [15/Oct/2026:12:00:03.001] https_frontend~ backend_api/api01 0/0/1/88/89 200 256 - - ---- 24/20/1/1/0 0/0 "POST /api/orders HTTP/1.1"
+Oct 15 12:00:04 lb01 haproxy[1001]: 192.0.2.99:51237 [15/Oct/2026:12:00:04.001] https_frontend~ backend_web/<NOSRV> 0/-1/-1/-1/0 503 187 - - SC-- 24/20/1/0/0 0/0 "GET /health HTTP/1.1"

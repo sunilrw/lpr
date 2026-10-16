@@ -1,5 +1,0 @@
-[
-  {"timestamp": "2026-10-15T10:20:00Z", "service": "auth-service", "event": "user_login", "user": "alice@company.com", "ip": "10.0.1.45", "status": "success"},
-  {"timestamp": "2026-10-15T10:20:05Z", "service": "payment-api", "event": "charge_created", "user": "bob@company.com", "ip": "192.168.1.12", "amount": 149.99, "currency": "USD"},
-  {"timestamp": "2026-10-15T10:21:10Z", "service": "auth-service", "event": "password_reset", "user": "charlie@company.com", "ip": "203.0.113.99", "status": "failed"}
-]

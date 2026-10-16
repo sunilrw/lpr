@@ -1,0 +1,6 @@
+198.51.100.20 - - [15/Oct/2026:11:00:01 +0000] "GET /blog/post-1 HTTP/1.1" 200 5400 "-" "Mozilla/5.0 (Windows NT 10.0) Firefox/119"
+198.51.100.20 - - [15/Oct/2026:11:00:02 +0000] "GET /images/logo.png HTTP/1.1" 304 - "https://example.com/blog" "Mozilla/5.0 (Windows NT 10.0) Firefox/119"
+203.0.113.55 - - [15/Oct/2026:11:00:03 +0000] "GET /server-status HTTP/1.1" 403 199 "-" "Mozilla/5.0"
+192.0.2.15 - - [15/Oct/2026:11:00:04 +0000] "GET /phpmyadmin/index.php HTTP/1.1" 404 295 "-" "sqlmap/1.6"
+198.51.100.60 - - [15/Oct/2026:11:00:05 +0000] "POST /contact/submit HTTP/1.1" 200 89 "https://example.com/contact" "Mozilla/5.0"
+192.0.2.90 - - [15/Oct/2026:11:00:06 +0000] "GET /index.php?page=../../etc/shadow%00 HTTP/1.1" 500 538 "-" "curl/7.88"

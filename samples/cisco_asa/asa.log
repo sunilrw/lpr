@@ -1,0 +1,5 @@
+Oct 15 2026 08:00:01: %ASA-6-302013: Built outbound TCP connection 12345 for outside:198.51.100.10/51234 to inside:10.0.0.5/443
+Oct 15 2026 08:00:02: %ASA-4-106023: Deny tcp src outside:192.0.2.99/51236 dst inside:10.0.0.5/3389 by access-group "OUTSIDE_IN"
+Oct 15 2026 08:00:03: %ASA-4-106023: Deny tcp src outside:192.0.2.99/51237 dst inside:10.0.0.5/22 by access-group "OUTSIDE_IN"
+Oct 15 2026 08:00:04: %ASA-6-305012: Teardown dynamic UDP translation from outside:203.0.113.210/53 to inside:10.0.0.8/53 duration 0:00:05
+Oct 15 2026 08:00:05: %ASA-4-733100: [ Scanning] drop rate-1 exceeded. Current burst rate is 10 per second, max configured rate is 10; Current average rate is 5 per second, max configured rate is 5; Cumulative total count is 100

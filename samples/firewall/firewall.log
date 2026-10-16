@@ -1,0 +1,6 @@
+date=2026-10-15 time=08:00:01 srcip=203.0.113.77 dstip=10.0.0.5 srcport=51235 dstport=443 action=allowed proto=TCP bytes_in=1024 bytes_out=4096
+date=2026-10-15 time=08:00:02 srcip=192.0.2.99 dstip=10.0.0.5 srcport=51236 dstport=22 action=denied proto=TCP bytes_in=60 bytes_out=0
+date=2026-10-15 time=08:00:03 srcip=192.0.2.99 dstip=10.0.0.5 srcport=51237 dstport=3389 action=denied proto=TCP bytes_in=60 bytes_out=0
+date=2026-10-15 time=08:00:04 srcip=203.0.113.210 dstip=10.0.0.5 srcport=51238 dstport=445 action=denied proto=TCP bytes_in=60 bytes_out=0
+date=2026-10-15 time=08:00:05 srcip=198.51.100.10 dstip=10.0.0.5 srcport=51239 dstport=443 action=allowed proto=TCP bytes_in=512 bytes_out=8192
+date=2026-10-15 time=08:00:06 srcip=192.0.2.99 dstip=10.0.0.5 srcport=51240 dstport=23 action=denied proto=TCP bytes_in=60 bytes_out=0

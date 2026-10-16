@@ -28,7 +28,7 @@ pub async fn run_mcp_stdio_server() -> Result<()> {
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "lpr-mcp", "version": "1.0.0" }
+                    "serverInfo": { "name": "lpr-mcp", "version": "1.2.0" }
                 }
             }),
             "notifications/initialized" => continue,
@@ -39,20 +39,32 @@ pub async fn run_mcp_stdio_server() -> Result<()> {
                     "tools": [
                         {
                             "name": "query_logs",
-                            "description": "Execute ANSI SQL against logs (W3C/IIS, JSON, AWS S3/VPC, Azure Blob, Cisco Config/ASA, FortiGate, Excel, CSV, Parquet, EVTX). UDFs: detect_threat(col), cluster_template(col), ip_in_cidr(ip, cidr), shannon_entropy(col).",
+                            "description": "Execute ANSI SQL, Microsoft Log Parser 2.2 SQL, or lnav filters against logs (W3C/IIS, JSON, AWS S3/VPC, Azure Blob, Cisco Config/ASA, FortiGate, Excel, CSV, Parquet, EVTX). Supports LogFilename, LogRow, detect_threat, cluster_template, ip_in_cidr, shannon_entropy, win32_error_description, extract_token, extract_extension.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "path": { "type": "string" },
+                                    "path": { "type": "string", "description": "Optional if specified in SQL FROM '<path>'" },
                                     "sql": { "type": "string" },
                                     "format": { "type": "string" }
                                 },
-                                "required": ["path", "sql"]
+                                "required": ["sql"]
                             }
                         },
                         {
                             "name": "audit_logs",
                             "description": "Run automated security audit against logs or Cisco configs.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "path": { "type": "string" },
+                                    "format": { "type": "string" }
+                                },
+                                "required": ["path"]
+                            }
+                        },
+                        {
+                            "name": "suggest_queries",
+                            "description": "Inspect a log file's schema and return context-aware, intent-based SQL query suggestions.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -96,13 +108,28 @@ async fn handle_mcp_tool(name: &str, args: &Value) -> String {
         };
     }
 
-    let engine = LogEngine::new();
-    if let Err(e) = engine.register_source("logs", path, fmt, None).await {
-        return format!("Error loading log source `{}`: {}", path, e);
+    if name == "suggest_queries" {
+        let engine = LogEngine::new();
+        return match engine.inspect_schema_and_intents(path, fmt).await {
+            Ok(discovery) => serde_json::to_string_pretty(&discovery).unwrap_or_default(),
+            Err(e) => format!("Schema Discovery Error: {}", e),
+        };
     }
 
     let sql = args["sql"].as_str().unwrap_or("SELECT * FROM logs LIMIT 25");
-    match engine.query(sql).await {
+    let (rewritten_sql, extracted_path) = crate::engine::extract_source_from_sql(sql);
+    let effective_path = if !path.trim().is_empty() {
+        path.trim()
+    } else {
+        extracted_path.as_deref().unwrap_or("")
+    };
+
+    let engine = LogEngine::new();
+    if let Err(e) = engine.register_source("logs", effective_path, fmt, None).await {
+        return format!("Error loading log source `{}`: {}", effective_path, e);
+    }
+
+    match engine.query(&rewritten_sql).await {
         Ok(batches) => batches_to_json_value(&batches).map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()).unwrap_or_default(),
         Err(e) => format!("SQL Execution Error: {}", e),
     }

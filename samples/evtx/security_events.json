@@ -1,0 +1,3 @@
+{"Event":{"System":{"EventID":{"Value":4625},"Channel":"Security","Computer":"WEB01.example.com","TimeCreated":{"SystemTime":"2026-10-15T10:00:01Z"}},"EventData":{"TargetUserName":"admin","IpAddress":"203.0.113.77","LogonType":3,"SubStatus":"0xC000006A"}}}
+{"Event":{"System":{"EventID":{"Value":4624},"Channel":"Security","Computer":"WEB01.example.com","TimeCreated":{"SystemTime":"2026-10-15T10:00:02Z"}},"EventData":{"TargetUserName":"svc-deploy","IpAddress":"198.51.100.10","LogonType":3}}}
+{"Event":{"System":{"EventID":{"Value":4625},"Channel":"Security","Computer":"WEB01.example.com","TimeCreated":{"SystemTime":"2026-10-15T10:00:03Z"}},"EventData":{"TargetUserName":"administrator","IpAddress":"203.0.113.77","LogonType":3,"SubStatus":"0xC0000064"}}}

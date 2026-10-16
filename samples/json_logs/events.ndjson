@@ -1,0 +1,5 @@
+{"timestamp":"2026-10-15T10:00:01Z","level":"INFO","service":"api","msg":"request handled","path":"/users","status":200,"duration_ms":12,"client_ip":"198.51.100.10"}
+{"timestamp":"2026-10-15T10:00:02Z","level":"ERROR","service":"api","msg":"db timeout","path":"/orders","status":500,"duration_ms":5000,"client_ip":"203.0.113.77"}
+{"timestamp":"2026-10-15T10:00:03Z","level":"WARN","service":"auth","msg":"failed login","user":"admin","client_ip":"192.0.2.99","attempt":3}
+{"timestamp":"2026-10-15T10:00:04Z","level":"INFO","service":"api","msg":"request handled","path":"/products","status":200,"duration_ms":45,"client_ip":"198.51.100.42"}
+{"timestamp":"2026-10-15T10:00:05Z","level":"ERROR","service":"api","msg":"unhandled exception","path":"/payment","status":502,"duration_ms":2100,"client_ip":"192.0.2.77"}

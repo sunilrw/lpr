@@ -1,0 +1,20 @@
+#Software: Microsoft Internet Information Services 10.0
+#Version: 1.0
+#Date: 2026-10-15 00:00:01
+#Fields: date time c-ip cs-method cs-uri-query cs-username sc-status sc-win32-status sc-bytes cs-bytes time-taken s-ip s-port
+2026-10-15 06:00:01 192.0.2.50 EHLO +mail.example.com - 220 0 0 0 0
+2026-10-15 06:00:02 192.0.2.50 MAIL +FROM:<alerts@example.com> - 250 0 0 0 0
+2026-10-15 06:00:03 192.0.2.50 RCPT +TO:<ops@example.com> - 250 0 0 0 0
+2026-10-15 06:00:04 192.0.2.50 DATA <msg-001@example.com> - 250 0 0 1024 0
+2026-10-15 06:01:01 203.0.113.99 EHLO +badhost.example.net - 220 0 0 0 0
+2026-10-15 06:01:02 203.0.113.99 AUTH - admin 535 2147942405 0 0 0
+2026-10-15 06:01:03 203.0.113.99 MAIL +FROM:<spoof@fakedomain.io> - 250 0 0 0 0
+2026-10-15 06:01:04 203.0.113.99 RCPT +TO:<external@other.org> - 550 0 0 0 0
+2026-10-15 06:01:05 203.0.113.99 VRFY +root - 502 0 0 0 0
+2026-10-15 06:02:01 198.51.100.20 EHLO +web02.example.com - 220 0 0 0 0
+2026-10-15 06:02:02 198.51.100.20 MAIL +FROM:<noreply@example.com> - 250 0 0 0 0
+2026-10-15 06:02:03 198.51.100.20 RCPT +TO:<user1@example.com> - 250 0 0 0 0
+2026-10-15 06:02:04 198.51.100.20 RCPT +TO:<user2@example.com> - 250 0 0 0 0
+2026-10-15 06:02:05 198.51.100.20 DATA <msg-002@example.com> - 250 0 0 2048 0
+2026-10-15 06:03:01 192.0.2.77 EHLO +scanner.probe.io - 220 0 0 0 0
+2026-10-15 06:03:02 192.0.2.77 EXPN +admin - 502 0 0 0 0

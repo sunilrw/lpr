@@ -1,5 +1,0 @@
-date=2026-10-15 time=10:14:02 devname=FGT-CORE-01 devid=FG100D3G15800001 type=traffic subtype=forward srcip=192.168.1.100 srcport=54321 dstip=10.0.0.15 dstport=443 proto=6 action=accept sentbyte=1250 rcvdbyte=8430 policyid=3
-date=2026-10-15 time=10:14:05 devname=FGT-CORE-01 devid=FG100D3G15800001 type=traffic subtype=forward srcip=203.0.113.88 srcport=43122 dstip=10.0.0.80 dstport=22 proto=6 action=deny sentbyte=64 rcvdbyte=0 policyid=0
-date=2026-10-15 time=10:14:12 devname=FGT-CORE-01 devid=FG100D3G15800001 type=traffic subtype=forward srcip=203.0.113.88 srcport=43123 dstip=10.0.0.80 dstport=23 proto=6 action=deny sentbyte=64 rcvdbyte=0 policyid=0
-date=2026-10-15 time=10:14:18 devname=FGT-CORE-01 devid=FG100D3G15800001 type=traffic subtype=forward srcip=172.16.5.20 srcport=51200 dstip=8.8.8.8 dstport=53 proto=17 action=accept sentbyte=82 rcvdbyte=144 policyid=5
-date=2026-10-15 time=10:14:22 devname=FGT-CORE-01 devid=FG100D3G15800001 type=traffic subtype=forward srcip=198.51.100.4 srcport=60111 dstip=10.0.0.80 dstport=3389 proto=6 action=deny sentbyte=64 rcvdbyte=0 policyid=0

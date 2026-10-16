@@ -1,6 +1,9 @@
 /target
 Cargo.lock
 *.parquet
-*.zip
 *.checkpoint.json
+lpr.config.json
+/samples_client_local/
 .DS_Store
+*.zip
+!samples/**/*.zip

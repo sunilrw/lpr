@@ -1,0 +1,14 @@
+#Software: Microsoft Internet Information Services 10.0
+#Version: 1.0
+#Date: 2026-10-14 00:00:01
+#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken
+2026-10-14 08:00:01 10.0.0.5 GET /index.html - 80 - 198.51.100.10 Mozilla/5.0 - 200 0 0 12
+2026-10-14 08:00:02 10.0.0.5 GET /styles.css - 80 - 198.51.100.10 Mozilla/5.0 http://example.com/ 304 0 0 4
+2026-10-14 08:00:03 10.0.0.5 GET /api/users id=1'+OR+'1'%3d'1 80 - 203.0.113.77 sqlmap/1.7 - 500 0 1326 420
+2026-10-14 08:00:04 10.0.0.5 GET /wp-login.php - 80 - 203.0.113.77 Mozilla/5.0 - 404 0 0 8
+2026-10-14 08:00:05 10.0.0.5 POST /checkout/pay - 80 - 198.51.100.42 Mozilla/5.0 https://example.com/cart 500 0 0 9213
+2026-10-14 08:00:06 10.0.0.5 GET /../../etc/passwd - 80 - 192.0.2.99 curl/8.0 - 400 0 0 3
+2026-10-14 08:00:07 10.0.0.5 GET /products.aspx cat=10;WAITFOR+DELAY+'0:0:10' 80 - 192.0.2.15 Mozilla/5.0 - 500 0 0 10012
+2026-10-14 08:00:08 10.0.0.5 GET /health - 80 - 10.0.0.9 kube-probe/1.28 - 200 0 0 2
+2026-10-14 08:00:09 10.0.0.5 GET /.env - 80 - 203.0.113.210 python-requests/2.31 - 404 0 0 6
+2026-10-14 08:00:10 10.0.0.5 POST /upload.aspx file=../../windows/win.ini 80 - 192.0.2.77 Mozilla/5.0 - 500 0 64 310

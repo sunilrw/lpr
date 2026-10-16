@@ -1,0 +1,4 @@
+timestamp	level	service	client_ip	path	status	latency_ms
+2026-10-15T10:00:01Z	INFO	api	198.51.100.10	/users	200	12
+2026-10-15T10:00:02Z	ERROR	api	203.0.113.77	/orders	500	5000
+2026-10-15T10:00:03Z	WARN	auth	192.0.2.99	/login	401	30
