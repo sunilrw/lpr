@@ -1,3 +1,4 @@
+use crate::sym::*;
 use crate::audit::evaluate_security_findings;
 use crate::engine::{extract_source_from_sql, LogEngine};
 use crate::parsers::InputFormat;
@@ -78,7 +79,7 @@ pub async fn run_http_server(bind_addr: &str, default_source: Option<String>) ->
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    eprintln!("🚀 lpr Studio v1.3.0 listening on http://{}", bind_addr);
+    eprintln!("{SYM_ROCKET} lpr Studio v1.3.0 listening on http://{}", bind_addr);
     axum::serve(listener, app).await?;
     Ok(())
 }

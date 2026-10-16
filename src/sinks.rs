@@ -1,3 +1,4 @@
+use crate::sym::*;
 use anyhow::Result;
 use arrow::csv::WriterBuilder as CsvWriterBuilder;
 use arrow::json::{ArrayWriter, LineDelimitedWriter};
@@ -267,7 +268,7 @@ pub fn write_batches_with_options(
             let metric_header = schema.field((col_count - 1).max(0)).name();
             writeln!(
                 out,
-                "📊 LPR TERMINAL BAR CHART  [{} vs {}]",
+                "{SYM_CHART} LPR TERMINAL BAR CHART  [{} vs {}]",
                 label_header, metric_header
             )?;
             writeln!(

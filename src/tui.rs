@@ -1,3 +1,4 @@
+use crate::sym::*;
 use crate::engine::{extract_source_from_sql, generate_intent_suggestions, IntentSuggestion, LogEngine};
 use crate::parsers::InputFormat;
 use anyhow::Result;
@@ -129,16 +130,16 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
 
             let top_bar = Paragraph::new(Line::from(vec![
                 Span::styled(
-                    " 🛡️ lpr Studio TUI v1.1.0 ",
+                    format!(" {SYM_SHIELD} lpr Studio TUI v1.1.0 "),
                     Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    format!("📁 {} ({:?}) ", active_source, detected_fmt),
+                    format!("{SYM_FOLDER} {} ({:?}) ", active_source, detected_fmt),
                     Style::default().fg(Color::LightCyan),
                 ),
                 Span::styled(
-                    format!("| 📋 Columns: {} ", columns.join(", ")),
+                    format!("| {SYM_LIST} Columns: {} ", columns.join(", ")),
                     Style::default().fg(Color::Gray),
                 ),
             ]));
@@ -206,7 +207,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                     f.render_widget(Clear, area);
                     let help_text = vec![
                         Line::from(Span::styled(
-                            "📚 LPR TUI & SQL COMPLETE REFERENCE MANUAL",
+                            format!("{SYM_BOOKS} LPR TUI & SQL COMPLETE REFERENCE MANUAL"),
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         )),
                         Line::from(""),
@@ -219,7 +220,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         Line::from("  • Ctrl+U      Clear SQL query input"),
                         Line::from("  • Esc         Close active modal or exit TUI"),
                         Line::from(""),
-                        Line::from("🛡️  CYBERSECURITY & LOG PARSER 2.2 SQL UDFs:"),
+                        Line::from(format!("{SYM_SHIELD}  CYBERSECURITY & LOG PARSER 2.2 SQL UDFs:")),
                         Line::from("  • detect_threat(col)             Detects SQLi, XSS, LFI, RCE/Log4Shell, SSRF"),
                         Line::from("  • ip_in_cidr(ip, '10.0.0.0/8')   IPv4/IPv6 CIDR subnet containment"),
                         Line::from("  • shannon_entropy(col)           0.0-8.0 entropy score for base64/DGA anomalies"),
@@ -231,7 +232,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         Line::from("  • to_timestamp(date, time)       [LogParser 2.2] Combine W3C date & time"),
                         Line::from("  • index_of(str, substr)          [LogParser 2.2] 0-based substring index"),
                         Line::from(""),
-                        Line::from("💡 MICROSOFT LOG PARSER 2.2 COMPATIBILITY:"),
+                        Line::from(format!("{SYM_TIP} MICROSOFT LOG PARSER 2.2 COMPATIBILITY:")),
                         Line::from("  • Query files directly in SQL:   SELECT * FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%'"),
                         Line::from("  • Hyphenated & TOP N syntax:     SELECT TOP 10 cs-uri-stem, [time-taken] FROM logs"),
                     ];
@@ -252,7 +253,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         .iter()
                         .enumerate()
                         .map(|(i, s)| {
-                            let prefix = if i == intent_idx { "▶ " } else { "  " };
+                            let prefix = if i == intent_idx { SYM_SEL.s() } else { "  " };
                             let style = if i == intent_idx {
                                 Style::default()
                                     .fg(Color::Black)
@@ -277,7 +278,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         Block::default()
                             .borders(Borders::ALL)
                             .style(Style::default().bg(Color::Black))
-                            .title(" 🧠 Context-Aware Intent Queries (↑/↓ to select, Enter to run, Esc to close) "),
+                            .title(format!(" {SYM_BRAIN} Context-Aware Intent Queries ({SYM_UP}/{SYM_DOWN} to select, Enter to run, Esc to close) ")),
                     );
                     f.render_widget(list, area);
                 }
@@ -288,8 +289,8 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         .iter()
                         .enumerate()
                         .map(|(i, item)| {
-                            let icon = if item.is_dir { "📁" } else { "📄" };
-                            let prefix = if i == browser_idx { "▶ " } else { "  " };
+                            let icon = if item.is_dir { format!("{SYM_FOLDER}") } else { format!("{SYM_FILE}") };
+                            let prefix = if i == browser_idx { SYM_SEL.s() } else { "  " };
                             let style = if i == browser_idx {
                                 Style::default()
                                     .fg(Color::Black)
@@ -311,7 +312,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                             .borders(Borders::ALL)
                             .style(Style::default().bg(Color::Black))
                             .title(format!(
-                                " 📂 File & Folder Browser: {} (↑/↓, Enter=Select, Esc=Close) ",
+                                " {SYM_DIR} File & Folder Browser: {} ({SYM_UP}/{SYM_DOWN}, Enter=Select, Esc=Close) ",
                                 current_dir.to_string_lossy()
                             )),
                     );
@@ -578,7 +579,7 @@ fn scan_directory(dir: &Path) -> Vec<BrowserItem> {
         sep
     );
     items.push(BrowserItem {
-        name: format!("✨ Query all *.log files in this folder ({})", glob_str),
+        name: format!("{SYM_SPARK} Query all *.log files in this folder ({})", glob_str),
         path: glob_str,
         is_dir: false,
     });

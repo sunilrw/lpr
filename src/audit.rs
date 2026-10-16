@@ -1,3 +1,4 @@
+use crate::sym::*;
 use crate::engine::LogEngine;
 use crate::parsers::InputFormat;
 use crate::sinks::batches_to_json_value;
@@ -60,18 +61,18 @@ pub async fn run_automated_security_audit(path_pattern: &str, explicit_format: I
     }
 
     println!("================================================================================");
-    println!(" 🛡️  LPR AUTOMATED MULTI-CLOUD, NETWORK & LOG SECURITY AUDIT REPORT");
-    println!(" 📁 Target: {} | Detected Profile: {:?}", path_pattern, fmt);
+    println!(" {SYM_SHIELD}  LPR AUTOMATED MULTI-CLOUD, NETWORK & LOG SECURITY AUDIT REPORT");
+    println!(" {SYM_FOLDER} Target: {} | Detected Profile: {:?}", path_pattern, fmt);
     println!("================================================================================\n");
 
     if findings.is_empty() {
-        println!("✅ No security findings or policy violations triggered across audit rules.");
+        println!("{SYM_DONE} No security findings or policy violations triggered across audit rules.");
         return Ok(());
     }
 
     for (idx, f) in findings.iter().enumerate() {
         println!("[{}] {} | {} — {} ({} matches)", idx + 1, f.severity, f.category, f.title, f.matched_count);
-        println!("    💡 Remediation: {}", f.remediation);
+        println!("    {SYM_TIP} Remediation: {}", f.remediation);
         for line in f.sample_evidence.lines() { println!("    {}", line); }
         println!();
     }

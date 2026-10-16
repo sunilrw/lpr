@@ -1,3 +1,4 @@
+use crate::sym::*;
 use crate::checkpoint::CheckpointStore;
 use anyhow::{Context, Result};
 use arrow::array::{ArrayRef, Int64Array, StringBuilder};
@@ -255,6 +256,83 @@ pub fn resolve_source_items(pattern: &str) -> Result<Vec<LogSourceItem>> {
         anyhow::bail!("No log files or ZIP archive entries matched: {}", pattern);
     }
     Ok(items)
+}
+
+/// Extracts a calendar date embedded in a log filename, e.g.
+/// `u_ex251014.log` (IIS W3C), `u_ex25101400.log` (hourly), `access-2026-10-14.log`,
+/// `error.20261014.log`. Returns the LAST date found in the name.
+fn filename_embedded_date(name: &str) -> Option<chrono::NaiveDate> {
+    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    // IIS-style u_exYYMMDD(HH) / u_inYYMMDD — checked first, most reliable
+    let re_iis = Regex::new(r"u_(?:ex|in|extend)(\d{6})(\d{2})?").unwrap();
+    if let Some(cap) = re_iis.captures_iter(stem).last() {
+        let yy: i32 = cap[1][..2].parse().unwrap_or(0);
+        let yy = if yy < 70 { 2000 + yy } else { 1900 + yy };
+        if let (Ok(mo), Ok(d)) = (cap[1][2..4].parse(), cap[1][4..6].parse()) {
+            if let Some(dt) = chrono::NaiveDate::from_ymd_opt(yy, mo, d) {
+                return Some(dt);
+            }
+        }
+    }
+    // Generic date stamps; keep the LAST match in the filename
+    let mut found = None;
+    let patterns = [
+        r"(\d{4})-(\d{2})-(\d{2})",
+        r"(?:^|[^0-9])(\d{4})(\d{2})(\d{2})(?:[^0-9]|$)",
+        r"(?:^|[^0-9])(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)",
+    ];
+    for (i, pat) in patterns.iter().enumerate() {
+        let re = Regex::new(pat).unwrap();
+        for cap in re.captures_iter(stem) {
+            let (y, mo, d): (i32, u32, u32) = if i == 2 {
+                let yy: i32 = cap[1].parse().unwrap_or(0);
+                (
+                    if yy < 70 { 2000 + yy } else { 1900 + yy },
+                    cap[2].parse().unwrap_or(0),
+                    cap[3].parse().unwrap_or(0),
+                )
+            } else {
+                (
+                    cap[1].parse().unwrap_or(0),
+                    cap[2].parse().unwrap_or(0),
+                    cap[3].parse().unwrap_or(0),
+                )
+            };
+            if let Some(dt) = chrono::NaiveDate::from_ymd_opt(y, mo, d) {
+                found = Some(dt);
+            }
+        }
+    }
+    found
+}
+
+/// Drops log files/zip entries that provably contain no rows on/after `cutoff`
+/// (IIS-style filename date or filesystem modified time). Items whose date
+/// can't be determined are kept. Prevents multi-GB scans of old rotated logs.
+pub fn filter_items_by_min_date(
+    items: Vec<LogSourceItem>,
+    cutoff: chrono::NaiveDate,
+) -> Vec<LogSourceItem> {
+    let mtime_grace = cutoff - chrono::Duration::days(1);
+    items
+        .into_iter()
+        .filter(|item| {
+            let name = item.display_name();
+            if let Some(d) = filename_embedded_date(&name) {
+                return d >= cutoff;
+            }
+            match item {
+                LogSourceItem::DiskFile(p) => std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        let t: chrono::DateTime<chrono::Utc> = t.into();
+                        t.date_naive() >= mtime_grace
+                    })
+                    .unwrap_or(true),
+                _ => true,
+            }
+        })
+        .collect()
 }
 
 pub fn open_source_item_reader(
@@ -752,7 +830,7 @@ pub fn parse_w3c_items_parallel(
 
             if verbose {
                 eprintln!(
-                    "  ✔ Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
+                    "  {SYM_OK} Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
                     disp_name, line_idx, row_count, elapsed_ms
                 );
             }
@@ -842,7 +920,7 @@ fn parse_w3c_single_item_utf16(
     let elapsed_ms = file_start.elapsed().as_millis();
     if verbose {
         eprintln!(
-            "  ✔ Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
+            "  {SYM_OK} Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
             disp_name,
             lines.len(),
             row_count,
@@ -1216,7 +1294,7 @@ pub fn parse_regex_items_parallel(
             let elapsed_ms = start.elapsed().as_millis();
             if verbose {
                 eprintln!(
-                    "  ✔ Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
+                    "  {SYM_OK} Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
                     disp_name,
                     lines.len(),
                     row_count,
@@ -1724,7 +1802,7 @@ pub fn parse_raw_items_parallel(
             let elapsed_ms = start.elapsed().as_millis();
             if verbose {
                 eprintln!(
-                    "  ✔ Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
+                    "  {SYM_OK} Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
                     fname,
                     lines.len(),
                     lines.len(),

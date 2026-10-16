@@ -1,5 +1,6 @@
+use crate::sym::*;
 use crate::engine::LogEngine;
-use crate::parsers::{resolve_source_items, InputFormat};
+use crate::parsers::{filter_items_by_min_date, resolve_source_items, InputFormat};
 use crate::sinks::batches_to_json_value;
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -273,13 +274,13 @@ pub fn print_saved_profiles(cfg_file_path: Option<&str>) {
     let path = LprConfigFile::resolve_config_path(cfg_file_path);
     let store = LprConfigFile::load(cfg_file_path);
     println!("================================================================================");
-    println!(" ⚙️  LPR SAVED CONFIGURATION PROFILES ({})", path.to_string_lossy());
+    println!(" {SYM_GEAR}  LPR SAVED CONFIGURATION PROFILES ({})", path.to_string_lossy());
     println!("================================================================================");
     if store.profiles.is_empty() {
         println!("  No profiles saved yet.");
-        println!("  💡 Save a profile once with:");
+        println!("  {SYM_TIP} Save a profile once with:");
         println!("     lpr fleet --save-profile prod-web --servers servers.csv --site MySite --threads 8 --days 7");
-        println!("  💡 Then run anytime with:");
+        println!("  {SYM_TIP} Then run anytime with:");
         println!("     lpr fleet --profile prod-web");
         println!("     lpr fleet --profile prod-web --server-numbers \"1-12\"");
         return;
@@ -290,7 +291,7 @@ pub fn print_saved_profiles(cfg_file_path: Option<&str>) {
         } else {
             ""
         };
-        println!("\n  🔹 Profile: `{}`{}", name, is_def);
+        println!("\n  {SYM_BULLET} Profile: `{}`{}", name, is_def);
         if let Some(ref d) = p.description {
             println!("     Description    : {}", d);
         }
@@ -436,11 +437,11 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         match prompt_and_encrypt_password() {
             Ok(hex_blob) => {
                 profile.auth_password_enc = Some(hex_blob);
-                eprintln!("🔐 Password stored DPAPI-encrypted (bound to this Windows user account only).");
+                eprintln!("{SYM_LOCK} Password stored DPAPI-encrypted (bound to this Windows user account only).");
             }
             Err(e) => {
                 eprintln!(
-                    "⚠️  --save-password could not store a secret here ({e}). Use --password-ref env:LPR_SMB_PASS, --password-ref file:<path>, or --password-ref prompt instead."
+                    "{SYM_WARN}  --save-password could not store a secret here ({e}). Use --password-ref env:LPR_SMB_PASS, --password-ref file:<path>, or --password-ref prompt instead."
                 );
             }
         }
@@ -465,7 +466,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         }
         let saved_path = cfg_store.save(req.cfg_file_path.as_deref())?;
         println!(
-            "💾 Saved profile `{}` to `{}` ({} servers stored in profile)",
+            "{SYM_SAVE} Saved profile `{}` to `{}` ({} servers stored in profile)",
             save_name,
             saved_path.to_string_lossy(),
             profile.servers.len()
@@ -508,9 +509,9 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     fs::create_dir_all(&output_dir)?;
 
     println!("================================================================================");
-    println!(" 🌐 LPR MULTI-SERVER FLEET SCANNER (Profile: `{}`)", active_profile_name);
+    println!(" {SYM_GLOBE} LPR MULTI-SERVER FLEET SCANNER (Profile: `{}`)", active_profile_name);
     println!(
-        " 📅 Days: {} (Cutoff >= {}) | Status: {}xx | Threads: {}",
+        " {SYM_CAL} Days: {} (Cutoff >= {}) | Status: {}xx | Threads: {}",
         days,
         cutoff_date,
         status_prefix,
@@ -518,7 +519,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             .map(|t| t.to_string())
             .unwrap_or_else(|| "Auto (All Cores)".to_string())
     );
-    println!(" 📁 Output Folder: {} | Report Prefix: {}", output_dir, report_prefix);
+    println!(" {SYM_FOLDER} Output Folder: {} | Report Prefix: {}", output_dir, report_prefix);
     println!("================================================================================");
 
     if let Some(ref local_target) = profile.local_path {
@@ -563,7 +564,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     };
 
     println!(
-        " 🖥️  Target Servers ({}) : {} | Stack: {} | Transport: {}",
+        " {SYM_SERVER}  Target Servers ({}) : {} | Stack: {} | Transport: {}",
         servers.len(),
         servers
             .iter()
@@ -605,7 +606,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                         .map(|r| format!("{} {}", r.date, r.time))
                         .unwrap_or_default();
                     println!(
-                        "  ✔  [SSH] {:14} ({:12}) -> {:>5} match(es) across {:>4} remote file(s)",
+                        "  {SYM_OK}  [SSH] {:14} ({:12}) -> {:>5} match(es) across {:>4} remote file(s)",
                         srv.name,
                         srv.ip,
                         rows.len(),
@@ -627,7 +628,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 }
                 Err(e) => {
                     println!(
-                        "  ⚠️  [SSH] {:14} ({:12}) -> Failed: {}",
+                        "  {SYM_WARN}  [SSH] {:14} ({:12}) -> Failed: {}",
                         srv.name, srv.ip, e
                     );
                     failed_servers.push(srv.name.clone());
@@ -692,7 +693,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
 
         if existing_paths.is_empty() {
             println!(
-                "  ⚠️  {:18} ({:12}) -> Path not accessible ({})",
+                "  {SYM_WARN}  {:18} ({:12}) -> Path not accessible ({})",
                 srv.name,
                 srv.ip,
                 candidate_paths.first().cloned().unwrap_or_default()
@@ -714,13 +715,16 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         }
 
         let joined_pattern = existing_paths.join(";");
-        let files_count = resolve_source_items(&joined_pattern)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let all_items = resolve_source_items(&joined_pattern).unwrap_or_default();
+        let total_files = all_items.len();
+        let cutoff_naive = chrono::NaiveDate::parse_from_str(&cutoff_date, "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+        let items = filter_items_by_min_date(all_items, cutoff_naive);
+        let files_count = items.len();
         let engine = LogEngine::with_options(threads, verbose);
         let input_fmt = parse_stack_input_format(&server_type);
         match engine
-            .register_source("logs", &joined_pattern, input_fmt, None)
+            .register_source_items("logs", items, input_fmt, None, None, Some(&joined_pattern))
             .await
         {
             Ok(detected_fmt) => {
@@ -738,12 +742,13 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                             .map(|r| format!("{} {}", r.date, r.time))
                             .unwrap_or_default();
                         println!(
-                            "  ✔  {:18} ({:12}) [{:?}] -> {:>5} match(es) across {:>4} log file(s)",
+                            "  {SYM_OK}  {:18} ({:12}) [{:?}] -> {:>5} match(es) across {:>4} of {:>4} log file(s)",
                             srv.name,
                             srv.ip,
                             detected_fmt,
                             rows.len(),
-                            files_count
+                            files_count,
+                            total_files
                         );
                         summaries.push(FleetServerSummary {
                             server_name: srv.name.clone(),
@@ -821,9 +826,16 @@ async fn run_local_or_archive_fleet_scan(
     verbose: bool,
 ) -> Result<()> {
     let items = resolve_source_items(target_path)?;
+    let cutoff_naive = chrono::NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let items = filter_items_by_min_date(items, cutoff_naive);
+    if items.is_empty() {
+        anyhow::bail!("No log files on/after {} in {}", cutoff_date, target_path);
+    }
+    let files_scanned = items.len();
     let engine = LogEngine::with_options(threads, verbose);
     let detected_fmt = engine
-        .register_source("logs", target_path, InputFormat::Auto, None)
+        .register_source_items("logs", items, InputFormat::Auto, None, None, Some(target_path))
         .await?;
     let cols = engine.table_columns("logs").await;
     let sql = build_multi_format_error_sql(&cols, status_prefix, cutoff_date);
@@ -852,7 +864,7 @@ async fn run_local_or_archive_fleet_scan(
         server_ip: srv_ip,
         success: true,
         total_errors: all_errors.len(),
-        log_files_scanned: items.len(),
+        log_files_scanned: files_scanned,
         engine: format!("lpr-{:?}", detected_fmt),
         first_error: first_err,
         last_error: last_err,
@@ -1063,11 +1075,11 @@ fn write_fleet_reports(
     fs::write(&manifest_txt, manifest_content)?;
 
     println!("--------------------------------------------------------------------------------");
-    println!(" ✅ Fleet Scan Complete!");
-    println!(" 📊 Total {}xx Matches : {}", status_prefix, all_errors.len());
-    println!(" 📄 Detail CSV        : {}", detail_csv.to_string_lossy());
-    println!(" 📋 Summary CSV       : {}", summary_csv.to_string_lossy());
-    println!(" 📝 Manifest File     : {}", manifest_txt.to_string_lossy());
+    println!(" {SYM_DONE} Fleet Scan Complete!");
+    println!(" {SYM_CHART} Total {}xx Matches : {}", status_prefix, all_errors.len());
+    println!(" {SYM_FILE} Detail CSV        : {}", detail_csv.to_string_lossy());
+    println!(" {SYM_LIST} Summary CSV       : {}", summary_csv.to_string_lossy());
+    println!(" {SYM_NOTE} Manifest File     : {}", manifest_txt.to_string_lossy());
     println!("================================================================================");
 
     Ok(())
@@ -1491,8 +1503,8 @@ fn resolve_secret(profile: &SavedProfile) -> Option<String> {
 /// Prompt for a password (hidden input) and DPAPI-encrypt it for profile storage. Windows only.
 #[cfg(windows)]
 fn prompt_and_encrypt_password() -> Result<String> {
-    eprintln!("⚠️  The password will be DPAPI-encrypted and bound to THIS Windows user account on THIS machine only.");
-    eprintln!("⚠️  Other users / machines cannot decrypt it. If the account changes, re-save with --save-password.");
+    eprintln!("{SYM_WARN}  The password will be DPAPI-encrypted and bound to THIS Windows user account on THIS machine only.");
+    eprintln!("{SYM_WARN}  Other users / machines cannot decrypt it. If the account changes, re-save with --save-password.");
     let pass = rpassword::prompt_password("Enter SMB password to encrypt: ")?;
     if pass.is_empty() {
         anyhow::bail!("empty password");
@@ -1579,7 +1591,7 @@ fn establish_smb_session(srv: &ServerEntry, profile: &SavedProfile) -> SmbSessio
         .output();
     let ok = out.map(|o| o.status.success()).unwrap_or(false);
     if !ok {
-        eprintln!("  ⚠️  net use {} as {} failed — falling back to current credentials", target, full_user);
+        eprintln!("  {SYM_WARN}  net use {} as {} failed — falling back to current credentials", target, full_user);
     }
     SmbSessionGuard::new(target, ok)
 }

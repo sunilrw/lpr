@@ -4,7 +4,7 @@ use crate::parsers::{
     parse_cef_files, parse_cisco_asa_files, parse_cisco_config_files, parse_evtx_files,
     parse_excel_files, parse_firewall_kv_files, parse_ias_files, parse_json_files,
     parse_raw_items_parallel, parse_regex_items_parallel, parse_w3c_items_parallel, resolve_paths,
-    resolve_source_items, InputFormat, ParseStats,
+    resolve_source_items, InputFormat, LogSourceItem, ParseStats,
 };
 use crate::udfs::register_all_udfs;
 use anyhow::Result;
@@ -305,6 +305,24 @@ impl LogEngine {
         ckpt: Option<&mut CheckpointStore>,
     ) -> Result<InputFormat> {
         let items = resolve_source_items(path_pattern)?;
+        self.register_source_items(table_name, items, format, custom_regex, ckpt, Some(path_pattern))
+            .await
+    }
+
+    /// Register a pre-resolved (and optionally pre-filtered) set of source items.
+    /// Used by fleet scans to skip out-of-window files before parsing.
+    pub async fn register_source_items(
+        &self,
+        table_name: &str,
+        items: Vec<LogSourceItem>,
+        format: InputFormat,
+        custom_regex: Option<&str>,
+        ckpt: Option<&mut CheckpointStore>,
+        path_pattern: Option<&str>,
+    ) -> Result<InputFormat> {
+        if items.is_empty() {
+            anyhow::bail!("No log files remained after filtering");
+        }
         let effective_format = if format == InputFormat::Auto {
             detect_format_item(&items[0])
         } else {
@@ -343,26 +361,30 @@ impl LogEngine {
                 self.register_batches(table_name, batches)?;
             }
             InputFormat::Csv => {
+                let pp = path_pattern
+                    .ok_or_else(|| anyhow::anyhow!("path pattern required for CSV input"))?;
                 self.ctx
-                    .register_csv(table_name, path_pattern, CsvReadOptions::new())
+                    .register_csv(table_name, pp, CsvReadOptions::new())
                     .await?;
             }
             InputFormat::Tsv => {
+                let pp = path_pattern
+                    .ok_or_else(|| anyhow::anyhow!("path pattern required for TSV input"))?;
                 self.ctx
-                    .register_csv(
-                        table_name,
-                        path_pattern,
-                        CsvReadOptions::new().delimiter(b'\t'),
-                    )
+                    .register_csv(table_name, pp, CsvReadOptions::new().delimiter(b'\t'))
                     .await?;
             }
             InputFormat::Parquet => {
+                let pp = path_pattern
+                    .ok_or_else(|| anyhow::anyhow!("path pattern required for Parquet input"))?;
                 self.ctx
-                    .register_parquet(table_name, path_pattern, ParquetReadOptions::default())
+                    .register_parquet(table_name, pp, ParquetReadOptions::default())
                     .await?;
             }
             other => {
-                let paths = resolve_paths(path_pattern)?;
+                let pp = path_pattern
+                    .ok_or_else(|| anyhow::anyhow!("path pattern required for this input format"))?;
+                let paths = resolve_paths(pp)?;
                 let batch = match other {
                     InputFormat::Excel => parse_excel_files(&paths)?,
                     InputFormat::Json | InputFormat::Akamai | InputFormat::Gcp => {

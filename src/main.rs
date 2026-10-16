@@ -8,9 +8,11 @@ mod mcp;
 mod parsers;
 mod server;
 mod sinks;
+mod sym;
 mod tui;
 mod udfs;
 
+use crate::sym::*;
 use anyhow::Result;
 use checkpoint::CheckpointStore;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -86,6 +88,10 @@ struct Cli {
     /// Enable detailed per-file verbose progress logging (shows each file, lines, rows, and parse time)
     #[arg(short = 'V', long = "verbose", global = true)]
     verbose: bool,
+
+    /// Force plain ASCII output (no emoji) for older consoles — auto-detected, or use LPR_ASCII=1
+    #[arg(long = "ascii", global = true)]
+    ascii: bool,
 
     /// Explicitly disable verbose per-file progress output
     #[arg(long = "no-verbose")]
@@ -432,7 +438,7 @@ pub fn print_sdk_templates(target: &str) {
         let _ = writeln!(
             out,
             r#"# ==============================================================================
-# 🟦 1. POWERSHELL MODULE & NATIVE PIPELINE INTEGRATION
+# {SYM_BSQ} 1. POWERSHELL MODULE & NATIVE PIPELINE INTEGRATION
 # ==============================================================================
 # Run `lpr.exe` directly in PowerShell and convert output into native PSObjects:
 
@@ -463,7 +469,7 @@ function Invoke-LprQuery {{
         let _ = writeln!(
             out,
             r#"// ==============================================================================
-// 🟪 2. .NET / C# SDK INTEGRATION (CLI Process & HTTP REST Client)
+// {SYM_PSQ} 2. .NET / C# SDK INTEGRATION (CLI Process & HTTP REST Client)
 // ==============================================================================
 using System;
 using System.Collections.Generic;
@@ -525,7 +531,7 @@ public sealed class LprClient
         let _ = writeln!(
             out,
             r#"# ==============================================================================
-# 🌐 3. HTTP REST API & AI MCP (MODEL CONTEXT PROTOCOL) INTEGRATION
+# {SYM_GLOBE} 3. HTTP REST API & AI MCP (MODEL CONTEXT PROTOCOL) INTEGRATION
 # ==============================================================================
 # Start REST API Server:
 #   lpr serve --bind 127.0.0.1:8080
@@ -542,7 +548,7 @@ pub fn print_full_manual() {
     let _ = writeln!(
         out,
         r#"
-📚 LPR v1.3.0 COMPLETE REFERENCE MANUAL (MULTI-THREADED + ZIP/GZ/ZST + LOG PARSER 2.2 + LINUX)
+{SYM_BOOKS} LPR v1.3.0 COMPLETE REFERENCE MANUAL (MULTI-THREADED + ZIP/GZ/ZST + LOG PARSER 2.2 + LINUX)
 ================================================================================
 
 1. DIRECT .ZIP, .GZ, AND .ZST ARCHIVE & MULTI-THREADED QUERYING
@@ -617,18 +623,18 @@ async fn run_suggest_command(
     }
 
     println!("================================================================================");
-    println!(" 🧠 LPR CONTEXT-AWARE SCHEMA & INTENT ASSISTANT");
+    println!(" {SYM_BRAIN} LPR CONTEXT-AWARE SCHEMA & INTENT ASSISTANT");
     println!(
-        " 📁 Source: {} | Format: {} | Rows: {}",
+        " {SYM_FOLDER} Source: {} | Format: {} | Rows: {}",
         file, discovery.detected_format, discovery.row_count_estimate
     );
     println!("================================================================================");
     println!(
-        "\n📋 DISCOVERED COLUMNS ({}):\n   {}\n",
+        "\n{SYM_LIST} DISCOVERED COLUMNS ({}):\n   {}\n",
         discovery.columns.len(),
         discovery.columns.join(", ")
     );
-    println!("⚡ RECOMMENDED INTENT-BASED SQL QUERIES:");
+    println!("{SYM_ZAP} RECOMMENDED INTENT-BASED SQL QUERIES:");
     for (idx, item) in discovery.suggestions.iter().enumerate() {
         println!(
             "\n  [{}] [{}] {} — {}",
@@ -648,8 +654,8 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
     let has = |c: &str| cols.iter().any(|x| x.eq_ignore_ascii_case(c));
 
     println!("================================================================================");
-    println!(" 📊 LPR EXECUTIVE LOG ANALYTICS & THREAT SUMMARY (GoAccess / LogParser Mode)");
-    println!(" 📁 Source: {} | Format: {:?}", file_pattern, fmt);
+    println!(" {SYM_CHART} LPR EXECUTIVE LOG ANALYTICS & THREAT SUMMARY (GoAccess / LogParser Mode)");
+    println!(" {SYM_FOLDER} Source: {} | Format: {:?}", file_pattern, fmt);
     println!("================================================================================");
 
     if let Ok(b) = engine.query("SELECT COUNT(*) AS total_rows FROM logs").await {
@@ -657,7 +663,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
     }
 
     if has("sc_status") {
-        println!("🔹 HTTP Status Distribution:");
+        println!("{SYM_BULLET} HTTP Status Distribution:");
         if let Ok(b) = engine
             .query("SELECT sc_status, COUNT(*) AS hits FROM logs GROUP BY 1 ORDER BY hits DESC")
             .await
@@ -665,7 +671,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
             write_batches(&b, OutputFormat::Chart, None)?;
         }
     } else if has("status") {
-        println!("🔹 Status Distribution:");
+        println!("{SYM_BULLET} Status Distribution:");
         if let Ok(b) = engine
             .query("SELECT status, COUNT(*) AS hits FROM logs GROUP BY 1 ORDER BY hits DESC")
             .await
@@ -675,7 +681,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
     }
 
     if has("c_ip") {
-        println!("\n🔹 Top Client IPs:");
+        println!("\n{SYM_BULLET} Top Client IPs:");
         if let Ok(b) = engine
             .query("SELECT c_ip, COUNT(*) AS requests FROM logs GROUP BY 1 ORDER BY requests DESC LIMIT 10")
             .await
@@ -683,7 +689,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
             write_batches(&b, OutputFormat::Chart, None)?;
         }
     } else if has("remote_addr") {
-        println!("\n🔹 Top Remote IPs:");
+        println!("\n{SYM_BULLET} Top Remote IPs:");
         if let Ok(b) = engine
             .query("SELECT remote_addr, COUNT(*) AS requests FROM logs GROUP BY 1 ORDER BY requests DESC LIMIT 10")
             .await
@@ -691,7 +697,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
             write_batches(&b, OutputFormat::Chart, None)?;
         }
     } else if has("srcip") {
-        println!("\n🔹 Top Firewall Source IPs:");
+        println!("\n{SYM_BULLET} Top Firewall Source IPs:");
         if let Ok(b) = engine
             .query("SELECT srcip, COUNT(*) AS events FROM logs GROUP BY 1 ORDER BY events DESC LIMIT 10")
             .await
@@ -712,7 +718,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             if smtp_cnt > 0 {
-                println!("\n📧 IIS SMTP — Unique Senders (FROM) & Sending Client IPs:");
+                println!("\n{SYM_MAIL} IIS SMTP — Unique Senders (FROM) & Sending Client IPs:");
                 if let Ok(b) = engine
                     .query("SELECT extract_email(COALESCE(cs_uri_query, cs_uri_stem)) AS from_address, extract_domain(COALESCE(cs_uri_query, cs_uri_stem)) AS sender_domain, c_ip AS sending_client_ip, COUNT(*) AS messages_sent FROM logs WHERE UPPER(cs_method) = 'MAIL' GROUP BY 1, 2, 3 ORDER BY messages_sent DESC")
                     .await
@@ -720,7 +726,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
                     write_batches(&b, OutputFormat::Table, None)?;
                 }
 
-                println!("📬 IIS SMTP — Top Recipients (TO) & Delivery Status:");
+                println!("{SYM_MAILBOX} IIS SMTP — Top Recipients (TO) & Delivery Status:");
                 if let Ok(b) = engine
                     .query("SELECT extract_email(COALESCE(cs_uri_query, cs_uri_stem)) AS to_address, extract_domain(COALESCE(cs_uri_query, cs_uri_stem)) AS recipient_domain, sc_status AS smtp_status, COUNT(*) AS recipient_hits FROM logs WHERE UPPER(cs_method) = 'RCPT' GROUP BY 1, 2, 3 ORDER BY recipient_hits DESC LIMIT 25")
                     .await
@@ -728,7 +734,7 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
                     write_batches(&b, OutputFormat::Table, None)?;
                 }
 
-                println!("🖥️  IIS SMTP — Connecting Client IPs & Announced EHLO/HELO Hostnames:");
+                println!("{SYM_SERVER}  IIS SMTP — Connecting Client IPs & Announced EHLO/HELO Hostnames:");
                 if let Ok(b) = engine
                     .query("SELECT c_ip AS client_ip, TRIM(LEADING '+' FROM COALESCE(cs_uri_query, cs_uri_stem)) AS ehlo_hostname, cs_username, COUNT(*) AS sessions FROM logs WHERE UPPER(cs_method) IN ('EHLO', 'HELO') GROUP BY 1, 2, 3 ORDER BY sessions DESC LIMIT 20")
                     .await
@@ -750,7 +756,7 @@ async fn main() -> Result<()> {
     if raw_args.len() <= 1 {
         let mut out = std::io::stdout();
         let _ = writeln!(out, "{}", get_ascii_banner());
-        let _ = writeln!(out, "\n💡 QUICK START:");
+        let _ = writeln!(out, "\n{SYM_TIP} QUICK START:");
         let _ = writeln!(out, "  • Query .log or .zip:   lpr \"SELECT * FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%' INTO 500.csv\"");
         let _ = writeln!(out, "  • Verbose Multi-Thread: lpr -V -j 8 -f samples/iis/u_extend01.log \"SELECT sc-status, COUNT(*) FROM logs GROUP BY 1\"");
         let _ = writeln!(out, "  • Linux grep / awk:     lpr -f samples/iis/u_extend01.log -g 500 -F date,time,c_ip,cs_uri_stem,sc_status");
@@ -767,6 +773,9 @@ async fn main() -> Result<()> {
 
     let processed_args = preprocess_cli_args(raw_args);
     let cli = Cli::parse_from(processed_args);
+    if cli.ascii {
+        sym::force_ascii();
+    }
 
     match cli.command {
         Some(Commands::Audit {
@@ -819,7 +828,7 @@ async fn main() -> Result<()> {
                 let mut store = fleet::LprConfigFile::load(cli.cfg_file.as_deref());
                 store.default_profile = def_name.clone();
                 let p = store.save(cli.cfg_file.as_deref())?;
-                println!("✅ Set default profile to `{}` in `{}`", def_name, p.to_string_lossy());
+                println!("{SYM_DONE} Set default profile to `{}` in `{}`", def_name, p.to_string_lossy());
             }
             fleet::print_saved_profiles(cli.cfg_file.as_deref());
             return Ok(());
@@ -925,7 +934,7 @@ async fn main() -> Result<()> {
         }
         let saved_path = cfg_store.save(cli.cfg_file.as_deref())?;
         eprintln!(
-            "💾 Saved CLI profile `{}` to `{}`",
+            "{SYM_SAVE} Saved CLI profile `{}` to `{}`",
             save_name,
             saved_path.to_string_lossy()
         );
@@ -1007,7 +1016,7 @@ async fn main() -> Result<()> {
             &mut log_file_writer,
             show_status,
             &format!(
-                " 🛡️  LPR v{} — Multi-Threaded Rust SQL Log Engine (DataFusion 42 / Arrow 53)",
+                " {SYM_SHIELD}  LPR v{} — Multi-Threaded Rust SQL Log Engine (DataFusion 42 / Arrow 53)",
                 LPR_VERSION
             ),
         );
@@ -1020,7 +1029,7 @@ async fn main() -> Result<()> {
             &mut log_file_writer,
             show_status,
             &format!(
-                " 📂 Input Source   : {} ({} file/archive stream(s), {:.2} MB uncompressed)",
+                " {SYM_DIR} Input Source   : {} ({} file/archive stream(s), {:.2} MB uncompressed)",
                 file_pattern,
                 source_items_preview.len(),
                 total_source_bytes as f64 / (1024.0 * 1024.0)
@@ -1030,7 +1039,7 @@ async fn main() -> Result<()> {
             &mut log_file_writer,
             show_status,
             &format!(
-                " ⚙️  Worker Threads : {} parallel thread(s) | Output Sink: {:?}{}",
+                " {SYM_GEAR}  Worker Threads : {} parallel thread(s) | Output Sink: {:?}{}",
                 engine.threads,
                 effective_output_format,
                 effective_out_file
@@ -1041,7 +1050,7 @@ async fn main() -> Result<()> {
         log_message(
             &mut log_file_writer,
             show_status,
-            &format!(" 🔍 SQL Query      : {}", raw_sql),
+            &format!(" {SYM_SEARCH} SQL Query      : {}", raw_sql),
         );
         log_message(
             &mut log_file_writer,
@@ -1058,7 +1067,7 @@ async fn main() -> Result<()> {
     if cli.tail {
         let mut ckpt_store = CheckpointStore::load(cli.checkpoint.as_deref());
         eprintln!(
-            "📡 Live-tailing `{}` (interval={}ms, Ctrl+C to stop)...",
+            "{SYM_RADIO} Live-tailing `{}` (interval={}ms, Ctrl+C to stop)...",
             file_pattern, cli.tail_interval_ms
         );
         loop {
@@ -1129,7 +1138,7 @@ async fn main() -> Result<()> {
                 &mut log_file_writer,
                 false,
                 &format!(
-                    "  ✔ Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
+                    "  {SYM_OK} Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
                     fsum.name, fsum.lines, fsum.rows, fsum.elapsed_ms
                 ),
             );
@@ -1218,7 +1227,7 @@ async fn main() -> Result<()> {
             &mut log_file_writer,
             show_on_stderr,
             &format!(
-                " ✅ Task Complete   : Detected Format: {:?} | Threads Used: {}",
+                " {SYM_DONE} Task Complete   : Detected Format: {:?} | Threads Used: {}",
                 detected_fmt, engine.threads
             ),
         );
@@ -1226,7 +1235,7 @@ async fn main() -> Result<()> {
             &mut log_file_writer,
             show_on_stderr,
             &format!(
-                " 📊 Statistics      : Files Processed : {:>10}  | Total Data   : {:>8.2} MB",
+                " {SYM_CHART} Statistics      : Files Processed : {:>10}  | Total Data   : {:>8.2} MB",
                 parse_stats.files_processed, mb_processed
             ),
         );
