@@ -217,28 +217,96 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScanPreFilter {
+    pub min_date: Option<String>,
+    pub status_prefix: Option<String>,
+}
+
+static RE_IIS_DATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)u_(?:ex|in)(\d{2})(\d{2})(\d{2})(?:\d{2})?").unwrap());
+static RE_ISO_DATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"((?:19|20)\d{2})-(\d{2})-(\d{2})").unwrap());
+static RE_COMPACT_YYYYMMDD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(\d{2})(\d{2})(?:[^0-9]|$)").unwrap()
+});
+
+fn max_zip_entry_bytes() -> u64 {
+    std::env::var("LPR_MAX_ENTRY_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(512 * 1024 * 1024)
+}
+
 /// Expands any `.zip` archives in `paths` into individual `LogSourceItem::ZipEntry` items
 /// so that all entries inside a `.zip` can be decompressed and parsed in parallel across threads!
 pub fn resolve_source_items(pattern: &str) -> Result<Vec<LogSourceItem>> {
+    resolve_source_items_with_cutoff(pattern, None)
+}
+
+pub fn resolve_source_items_with_cutoff(
+    pattern: &str,
+    cutoff: Option<chrono::NaiveDate>,
+) -> Result<Vec<LogSourceItem>> {
     if is_stdin_path(pattern) {
         return Ok(vec![LogSourceItem::Stdin]);
     }
     let paths = resolve_paths(pattern)?;
+    let mtime_grace = cutoff.map(|c| c - chrono::Duration::days(1));
     let mut items = Vec::new();
     for path in paths {
+        if let Some(c) = cutoff {
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(d) = filename_embedded_date(fname) {
+                if d < c {
+                    continue;
+                }
+            } else if let Some(grace) = mtime_grace {
+                let keep = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Utc> = t.into();
+                        dt.date_naive() >= grace
+                    })
+                    .unwrap_or(true);
+                if !keep {
+                    continue;
+                }
+            }
+        }
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
         if ext == "zip" {
-            let file = File::open(&path)
-                .with_context(|| format!("Failed to open ZIP archive {:?}", path))?;
-            let mut archive = zip::ZipArchive::new(BufReader::new(file))
-                .with_context(|| format!("Invalid ZIP archive {:?}", path))?;
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let Ok(mut archive) = zip::ZipArchive::new(BufReader::new(file)) else {
+                continue;
+            };
             for idx in 0..archive.len() {
                 if let Ok(entry) = archive.by_index_raw(idx) {
                     if entry.is_file() && !entry.name().starts_with("__MACOSX") {
+                        if let Some(c) = cutoff {
+                            if let Some(d) = filename_embedded_date(entry.name()) {
+                                if d < c {
+                                    continue;
+                                }
+                            } else if let Some(dt) = entry.last_modified() {
+                                if let Some(nd) = chrono::NaiveDate::from_ymd_opt(
+                                    dt.year() as i32,
+                                    dt.month() as u32,
+                                    dt.day() as u32,
+                                ) {
+                                    if nd < c {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         items.push(LogSourceItem::ZipEntry {
                             archive_path: path.clone(),
                             entry_index: idx,
@@ -259,45 +327,28 @@ pub fn resolve_source_items(pattern: &str) -> Result<Vec<LogSourceItem>> {
 }
 
 /// Extracts a calendar date embedded in a log filename, e.g.
-/// `u_ex251014.log` (IIS W3C), `u_ex25101400.log` (hourly), `access-2026-10-14.log`,
-/// `error.20261014.log`. Returns the LAST date found in the name.
+/// `u_ex251014.log` (IIS W3C daily), `u_ex25101400.log` (hourly), `access-2026-10-14.log`,
+/// `error.20261014.log`. Does NOT misinterpret IIS size-rollover sequence numbers (`u_extend22.log`,
+/// `u_extend100512.log`) as dates.
 fn filename_embedded_date(name: &str) -> Option<chrono::NaiveDate> {
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    // IIS-style u_exYYMMDD(HH) / u_inYYMMDD — checked first, most reliable
-    let re_iis = Regex::new(r"u_(?:ex|in|extend)(\d{6})(\d{2})?").unwrap();
-    if let Some(cap) = re_iis.captures_iter(stem).last() {
-        let yy: i32 = cap[1][..2].parse().unwrap_or(0);
-        let yy = if yy < 70 { 2000 + yy } else { 1900 + yy };
-        if let (Ok(mo), Ok(d)) = (cap[1][2..4].parse(), cap[1][4..6].parse()) {
-            if let Some(dt) = chrono::NaiveDate::from_ymd_opt(yy, mo, d) {
+    // 1. IIS daily/hourly u_exYYMMDD(HH) / u_inYYMMDD
+    if let Some(cap) = RE_IIS_DATE.captures_iter(stem).last() {
+        let yy: i32 = cap[1].parse().unwrap_or(0);
+        let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
+        if let (Ok(mo), Ok(d)) = (cap[2].parse::<u32>(), cap[3].parse::<u32>()) {
+            if let Some(dt) = chrono::NaiveDate::from_ymd_opt(year, mo, d) {
                 return Some(dt);
             }
         }
     }
-    // Generic date stamps; keep the LAST match in the filename
+    // 2. Explicit 4-digit year dates: YYYY-MM-DD or YYYYMMDD
     let mut found = None;
-    let patterns = [
-        r"(\d{4})-(\d{2})-(\d{2})",
-        r"(?:^|[^0-9])(\d{4})(\d{2})(\d{2})(?:[^0-9]|$)",
-        r"(?:^|[^0-9])(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)",
-    ];
-    for (i, pat) in patterns.iter().enumerate() {
-        let re = Regex::new(pat).unwrap();
+    for re in [&*RE_ISO_DATE, &*RE_COMPACT_YYYYMMDD] {
         for cap in re.captures_iter(stem) {
-            let (y, mo, d): (i32, u32, u32) = if i == 2 {
-                let yy: i32 = cap[1].parse().unwrap_or(0);
-                (
-                    if yy < 70 { 2000 + yy } else { 1900 + yy },
-                    cap[2].parse().unwrap_or(0),
-                    cap[3].parse().unwrap_or(0),
-                )
-            } else {
-                (
-                    cap[1].parse().unwrap_or(0),
-                    cap[2].parse().unwrap_or(0),
-                    cap[3].parse().unwrap_or(0),
-                )
-            };
+            let y: i32 = cap[1].parse().unwrap_or(0);
+            let mo: u32 = cap[2].parse().unwrap_or(0);
+            let d: u32 = cap[3].parse().unwrap_or(0);
             if let Some(dt) = chrono::NaiveDate::from_ymd_opt(y, mo, d) {
                 found = Some(dt);
             }
@@ -329,7 +380,14 @@ pub fn filter_items_by_min_date(
                         t.date_naive() >= mtime_grace
                     })
                     .unwrap_or(true),
-                _ => true,
+                LogSourceItem::ZipEntry { archive_path, .. } => std::fs::metadata(archive_path)
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        let t: chrono::DateTime<chrono::Utc> = t.into();
+                        t.date_naive() >= mtime_grace
+                    })
+                    .unwrap_or(true),
+                LogSourceItem::Stdin => true,
             }
         })
         .collect()
@@ -359,9 +417,10 @@ pub fn open_source_item_reader(
             let file = File::open(archive_path)
                 .with_context(|| format!("Failed to open ZIP {:?}", archive_path))?;
             let mut archive = zip::ZipArchive::new(BufReader::with_capacity(256 * 1024, file))?;
-            let mut entry = archive.by_index(*entry_index)?;
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut buf)?;
+            let entry = archive.by_index(*entry_index)?;
+            let cap = entry.size().min(8 * 1024 * 1024) as usize;
+            let mut buf = Vec::with_capacity(cap);
+            entry.take(max_zip_entry_bytes()).read_to_end(&mut buf)?;
             Ok(Box::new(Cursor::new(buf)))
         }
     }
@@ -393,10 +452,11 @@ pub fn open_log_reader_with_checkpoint(
         "zip" => {
             let mut archive = zip::ZipArchive::new(BufReader::with_capacity(256 * 1024, file))?;
             for idx in 0..archive.len() {
-                let mut entry = archive.by_index(idx)?;
+                let entry = archive.by_index(idx)?;
                 if entry.is_file() {
-                    let mut buf = Vec::with_capacity(entry.size() as usize);
-                    entry.read_to_end(&mut buf)?;
+                    let cap = entry.size().min(8 * 1024 * 1024) as usize;
+                    let mut buf = Vec::with_capacity(cap);
+                    entry.take(max_zip_entry_bytes()).read_to_end(&mut buf)?;
                     return Ok(Box::new(Cursor::new(buf)));
                 }
             }
@@ -692,10 +752,19 @@ const DEFAULT_IIS_W3C_FIELDS: &[&str] = &[
 
 /// High-performance multi-threaded W3C / IIS parser.
 /// Parses each file or ZIP entry in parallel on a Rayon thread pool, building a `RecordBatch`
-/// per file without intermediate `Vec<Vec<String>>` row allocations.
+/// per file without intermediate `Vec<Vec<String>>` row allocations, and applies optional
+/// streaming row-level pushdown filters (`min_date` / `status_prefix`) BEFORE Arrow allocation.
 pub fn parse_w3c_items_parallel(
     items: &[LogSourceItem],
     verbose: bool,
+) -> Result<(Vec<RecordBatch>, ParseStats)> {
+    parse_w3c_items_parallel_filtered(items, verbose, None)
+}
+
+pub fn parse_w3c_items_parallel_filtered(
+    items: &[LogSourceItem],
+    verbose: bool,
+    pre_filter: Option<&ScanPreFilter>,
 ) -> Result<(Vec<RecordBatch>, ParseStats)> {
     // Step 1: Discover canonical W3C field list across the items (scanning headers quickly)
     let mut canonical_fields: Vec<String> = Vec::new();
@@ -730,6 +799,10 @@ pub fn parse_w3c_items_parallel(
     let schema = Arc::new(Schema::new(arrow_fields));
 
     let num_data_cols = canonical_fields.len();
+    let canon_status_idx = canonical_fields.iter().position(|c| c == "sc_status");
+    let canon_date_idx = canonical_fields.iter().position(|c| c == "date");
+    let filter_min_date = pre_filter.and_then(|f| f.min_date.as_deref());
+    let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
 
     // Step 2: Process every file / ZIP entry in parallel via Rayon!
     let per_file_results: Vec<Result<(RecordBatch, FileParseSummary)>> = items
@@ -741,14 +814,20 @@ pub fn parse_w3c_items_parallel(
             let bytes = item.size_bytes();
 
             let mut reader = open_source_item_reader(item, &mut None)?;
+            // Modest initial capacity (256 rows / 4 KB per col) so 80+ files never pre-allocate GBs of unused RAM
             let mut builders: Vec<StringBuilder> = (0..num_data_cols + 2)
-                .map(|_| StringBuilder::with_capacity(64 * 1024, 1024 * 1024))
+                .map(|_| StringBuilder::with_capacity(256, 4096))
                 .collect();
 
             let mut line_buf: Vec<u8> = Vec::with_capacity(8192);
             let mut line_idx: usize = 0;
             let mut row_count: usize = 0;
             let mut first_chunk = true;
+            let mut file_status_idx = canon_status_idx;
+            let mut file_date_idx = canon_date_idx;
+            let mut file_num_cols = num_data_cols;
+            // Maps canonical column `c` -> token index in this file (None if canonical matches 1:1)
+            let mut custom_col_map: Option<Vec<Option<usize>>> = None;
 
             loop {
                 line_buf.clear();
@@ -772,6 +851,7 @@ pub fn parse_w3c_items_parallel(
                             num_data_cols,
                             file_start,
                             verbose,
+                            pre_filter,
                         );
                     }
                 }
@@ -782,7 +862,32 @@ pub fn parse_w3c_items_parallel(
                 while slice.first().map(|b| b.is_ascii_whitespace()).unwrap_or(false) {
                     slice = &slice[1..];
                 }
-                if slice.is_empty() || slice[0] == b'#' {
+                if slice.is_empty() {
+                    continue;
+                }
+                if slice[0] == b'#' {
+                    if slice.starts_with(b"#Fields:") {
+                        if let Ok(hdr) = std::str::from_utf8(&slice[8..]) {
+                            let file_cols: Vec<String> = hdr
+                                .split_whitespace()
+                                .map(|s| s.replace('-', "_").replace(['(', ')'], "").to_lowercase())
+                                .collect();
+                            if !file_cols.is_empty() {
+                                file_num_cols = file_cols.len();
+                                file_status_idx = file_cols.iter().position(|c| c == "sc_status");
+                                file_date_idx = file_cols.iter().position(|c| c == "date");
+                                if file_cols != canonical_fields {
+                                    let map: Vec<Option<usize>> = canonical_fields
+                                        .iter()
+                                        .map(|cf| file_cols.iter().position(|fc| fc == cf))
+                                        .collect();
+                                    custom_col_map = Some(map);
+                                } else {
+                                    custom_col_map = None;
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -803,15 +908,45 @@ pub fn parse_w3c_items_parallel(
                 }
 
                 // Standard W3C row or IIS SMTP W3C row (where trailing cs-uri-query/parameters can contain spaces or be omitted)
-                if t_count == num_data_cols
-                    || (t_count >= num_data_cols.saturating_sub(2) && num_data_cols >= 6)
+                if t_count == file_num_cols
+                    || (t_count >= file_num_cols.saturating_sub(2) && file_num_cols >= 6)
                 {
-                    for c in 0..num_data_cols {
-                        let v = if c < t_count { tokens[c] } else { "" };
-                        if v == "-" || v.is_empty() {
-                            builders[c].append_null();
-                        } else {
-                            builders[c].append_value(v);
+                    // Zero-allocation pushdown pre-filter: skip non-matching status / old dates BEFORE touching Arrow StringBuilder!
+                    if let Some(sp) = filter_status_prefix {
+                        if let Some(s_idx) = file_status_idx {
+                            if s_idx >= t_count || !tokens[s_idx].starts_with(sp) {
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(md) = filter_min_date {
+                        if let Some(d_idx) = file_date_idx {
+                            if d_idx < t_count && !tokens[d_idx].is_empty() && tokens[d_idx] < md {
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(ref cmap) = custom_col_map {
+                        for c in 0..num_data_cols {
+                            let v = cmap[c]
+                                .filter(|&idx| idx < t_count)
+                                .map(|idx| tokens[idx])
+                                .unwrap_or("");
+                            if v == "-" || v.is_empty() {
+                                builders[c].append_null();
+                            } else {
+                                builders[c].append_value(v);
+                            }
+                        }
+                    } else {
+                        for c in 0..num_data_cols {
+                            let v = if c < t_count { tokens[c] } else { "" };
+                            if v == "-" || v.is_empty() {
+                                builders[c].append_null();
+                            } else {
+                                builders[c].append_value(v);
+                            }
                         }
                     }
                     builders[num_data_cols].append_value(&short_name);
@@ -881,15 +1016,20 @@ fn parse_w3c_single_item_utf16(
     num_data_cols: usize,
     file_start: std::time::Instant,
     verbose: bool,
+    pre_filter: Option<&ScanPreFilter>,
 ) -> Result<(RecordBatch, FileParseSummary)> {
     let short_name = item.short_filename();
     let disp_name = item.display_name();
     let bytes = item.size_bytes();
     let lines = read_decoded_lines_from_item(item, &mut None, None)?;
     let mut builders: Vec<StringBuilder> = (0..num_data_cols + 2)
-        .map(|_| StringBuilder::new())
+        .map(|_| StringBuilder::with_capacity(256, 4096))
         .collect();
     let mut row_count = 0;
+    let status_idx = schema.fields().iter().position(|f| f.name() == "sc_status");
+    let date_idx = schema.fields().iter().position(|f| f.name() == "date");
+    let filter_min_date = pre_filter.and_then(|f| f.min_date.as_deref());
+    let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -898,6 +1038,20 @@ fn parse_w3c_single_item_utf16(
         }
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() == num_data_cols {
+            if let Some(sp) = filter_status_prefix {
+                if let Some(s_idx) = status_idx {
+                    if s_idx >= parts.len() || !parts[s_idx].starts_with(sp) {
+                        continue;
+                    }
+                }
+            }
+            if let Some(md) = filter_min_date {
+                if let Some(d_idx) = date_idx {
+                    if d_idx < parts.len() && !parts[d_idx].is_empty() && parts[d_idx] < md {
+                        continue;
+                    }
+                }
+            }
             for c in 0..num_data_cols {
                 let v = parts[c];
                 if v == "-" || v.is_empty() {
@@ -1237,6 +1391,15 @@ pub fn parse_regex_items_parallel(
     re: &Regex,
     verbose: bool,
 ) -> Result<(Vec<RecordBatch>, ParseStats)> {
+    parse_regex_items_parallel_filtered(items, re, verbose, None)
+}
+
+pub fn parse_regex_items_parallel_filtered(
+    items: &[LogSourceItem],
+    re: &Regex,
+    verbose: bool,
+    pre_filter: Option<&ScanPreFilter>,
+) -> Result<(Vec<RecordBatch>, ParseStats)> {
     let mut group_names: Vec<String> = re
         .capture_names()
         .flatten()
@@ -1254,6 +1417,13 @@ pub fn parse_regex_items_parallel(
         .map(|name| Field::new(name, DataType::Utf8, true))
         .collect();
     let schema = Arc::new(Schema::new(arrow_fields));
+    let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
+    let status_group_idx = group_names.iter().position(|g| {
+        matches!(
+            g.as_str(),
+            "status" | "elb_status_code" | "http_status" | "sc_status"
+        )
+    });
 
     let per_file: Vec<Result<(RecordBatch, FileParseSummary)>> = items
         .par_iter()
@@ -1263,12 +1433,26 @@ pub fn parse_regex_items_parallel(
             let disp_name = item.display_name();
             let bytes = item.size_bytes();
             let lines = read_decoded_lines_from_item(item, &mut None, None)?;
-            let mut builders: Vec<StringBuilder> =
-                (0..base_len + 2).map(|_| StringBuilder::new()).collect();
+            let mut builders: Vec<StringBuilder> = (0..base_len + 2)
+                .map(|_| StringBuilder::with_capacity(256, 4096))
+                .collect();
             let mut row_count = 0;
 
             for (line_idx, line) in lines.iter().enumerate() {
                 if let Some(caps) = re.captures(line) {
+                    if let (Some(sp), Some(s_idx)) = (filter_status_prefix, status_group_idx) {
+                        let st = caps
+                            .name(&group_names[s_idx])
+                            .map(|m| m.as_str())
+                            .unwrap_or("");
+                        let target_st = caps
+                            .name("target_status_code")
+                            .map(|m| m.as_str())
+                            .unwrap_or("");
+                        if !st.starts_with(sp) && !target_st.starts_with(sp) {
+                            continue;
+                        }
+                    }
                     for c in 0..base_len {
                         let val = caps
                             .name(&group_names[c])

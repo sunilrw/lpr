@@ -28,7 +28,7 @@ pub async fn run_mcp_stdio_server() -> Result<()> {
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "lpr-mcp", "version": "1.2.0" }
+                    "serverInfo": { "name": "lpr-mcp", "version": env!("CARGO_PKG_VERSION") }
                 }
             }),
             "notifications/initialized" => continue,

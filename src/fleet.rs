@@ -1,6 +1,9 @@
 use crate::sym::*;
 use crate::engine::LogEngine;
-use crate::parsers::{filter_items_by_min_date, resolve_source_items, InputFormat};
+use crate::parsers::{
+    filter_items_by_min_date, resolve_source_items, resolve_source_items_with_cutoff, InputFormat,
+    ScanPreFilter,
+};
 use crate::sinks::batches_to_json_value;
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -165,6 +168,11 @@ impl LprConfigFile {
         let path = Self::resolve_config_path(explicit);
         let json = serde_json::to_string_pretty(self)?;
         fs::write(&path, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
         Ok(path)
     }
 }
@@ -315,6 +323,19 @@ pub fn print_saved_profiles(cfg_file_path: Option<&str>) {
         if p.local_path.is_some() {
             println!("     Local Path     : {:?}", p.local_path);
         }
+        if let Some(ref u) = p.auth_user {
+            let secret_mode = if p.auth_password_enc.is_some() {
+                "DPAPI-encrypted blob"
+            } else if let Some(ref r) = p.auth_password_ref {
+                r.as_str()
+            } else {
+                "none"
+            };
+            println!(
+                "     SMB Auth       : user={:?} domain={:?} secret=[{}]",
+                u, p.auth_domain, secret_mode
+            );
+        }
     }
     println!();
 }
@@ -431,7 +452,15 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         profile.auth_domain = Some(ad.clone());
     }
     if let Some(ref pr) = req.password_ref {
-        profile.auth_password_ref = Some(pr.clone());
+        let trimmed = pr.trim();
+        let lower = trimmed.to_lowercase();
+        if !(lower == "prompt" || lower.starts_with("env:") || lower.starts_with("file:")) {
+            anyhow::bail!(
+                "Invalid --password-ref `{}`: must be `env:VAR_NAME`, `file:PATH`, or `prompt` (plaintext passwords are never accepted on CLI or stored in config; use `--save-password` for DPAPI encryption)",
+                trimmed
+            );
+        }
+        profile.auth_password_ref = Some(trimmed.to_string());
     }
     if req.save_password {
         match prompt_and_encrypt_password() {
@@ -580,6 +609,13 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     let mut summaries: Vec<FleetServerSummary> = Vec::new();
     let mut failed_servers: Vec<String> = Vec::new();
 
+    #[cfg(windows)]
+    let resolved_smb_secret = if profile.auth_user.is_some() {
+        resolve_secret(&profile)
+    } else {
+        None
+    };
+
     for srv in &servers {
         // SSH Transport Mode for Linux / Unix Web Servers (Nginx, Apache, Caddy, HAProxy, Tomcat)
         if ssh_enabled {
@@ -653,13 +689,19 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
 
         // If alternate SMB credentials are configured, establish a `net use` IPC$ session first (Windows only).
         #[cfg(windows)]
-        let _smb_guard = establish_smb_session(srv, &profile);
+        let _smb_guard = establish_smb_session(srv, &profile, resolved_smb_secret.as_deref());
 
         // 1. Expand user-configured log_path / archive_path / path_templates (converting local D:\... to \\server\d$\... automatically!)
         for tpl in &path_templates {
             let expanded = expand_remote_path_template(tpl, &srv.name, &srv.ip, &site_name);
             if !candidate_paths.contains(&expanded) {
                 candidate_paths.push(expanded);
+            }
+            if !srv.ip.is_empty() && srv.ip != srv.name {
+                let expanded_ip = expand_remote_path_template(tpl, &srv.ip, &srv.ip, &site_name);
+                if !candidate_paths.contains(&expanded_ip) {
+                    candidate_paths.push(expanded_ip);
+                }
             }
         }
 
@@ -715,16 +757,47 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         }
 
         let joined_pattern = existing_paths.join(";");
-        let all_items = resolve_source_items(&joined_pattern).unwrap_or_default();
-        let total_files = all_items.len();
         let cutoff_naive = chrono::NaiveDate::parse_from_str(&cutoff_date, "%Y-%m-%d")
             .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+        let all_items = resolve_source_items(&joined_pattern).unwrap_or_default();
+        let total_files = all_items.len();
         let items = filter_items_by_min_date(all_items, cutoff_naive);
         let files_count = items.len();
+        if items.is_empty() {
+            println!(
+                "  {SYM_OK}  {:18} ({:12}) [Skip] ->     0 match(es) across    0 of {:>4} log file(s) in date window",
+                srv.name, srv.ip, total_files
+            );
+            summaries.push(FleetServerSummary {
+                server_name: srv.name.clone(),
+                server_ip: srv.ip.clone(),
+                success: true,
+                total_errors: 0,
+                log_files_scanned: 0,
+                engine: "lpr-window-skip".to_string(),
+                first_error: String::new(),
+                last_error: String::new(),
+                scanned_paths: existing_paths.join("; "),
+                error_message: String::new(),
+            });
+            continue;
+        }
+        let pre_filter = ScanPreFilter {
+            min_date: Some(cutoff_date.clone()),
+            status_prefix: Some(status_prefix.clone()),
+        };
         let engine = LogEngine::with_options(threads, verbose);
         let input_fmt = parse_stack_input_format(&server_type);
         match engine
-            .register_source_items("logs", items, input_fmt, None, None, Some(&joined_pattern))
+            .register_source_items_filtered(
+                "logs",
+                items,
+                input_fmt,
+                None,
+                None,
+                Some(&joined_pattern),
+                Some(&pre_filter),
+            )
             .await
         {
             Ok(detected_fmt) => {
@@ -825,17 +898,29 @@ async fn run_local_or_archive_fleet_scan(
     threads: Option<usize>,
     verbose: bool,
 ) -> Result<()> {
-    let items = resolve_source_items(target_path)?;
     let cutoff_naive = chrono::NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let items = resolve_source_items_with_cutoff(target_path, Some(cutoff_naive))?;
     let items = filter_items_by_min_date(items, cutoff_naive);
     if items.is_empty() {
         anyhow::bail!("No log files on/after {} in {}", cutoff_date, target_path);
     }
     let files_scanned = items.len();
+    let pre_filter = ScanPreFilter {
+        min_date: Some(cutoff_date.to_string()),
+        status_prefix: Some(status_prefix.to_string()),
+    };
     let engine = LogEngine::with_options(threads, verbose);
     let detected_fmt = engine
-        .register_source_items("logs", items, InputFormat::Auto, None, None, Some(target_path))
+        .register_source_items_filtered(
+            "logs",
+            items,
+            InputFormat::Auto,
+            None,
+            None,
+            Some(target_path),
+            Some(&pre_filter),
+        )
         .await?;
     let cols = engine.table_columns("logs").await;
     let sql = build_multi_format_error_sql(&cols, status_prefix, cutoff_date);
@@ -1037,10 +1122,19 @@ fn write_fleet_reports(
     summaries: &[FleetServerSummary],
     failed_servers: &[String],
 ) -> Result<()> {
+    let safe_prefix: String = report_prefix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | '.'))
+        .collect();
+    let safe_prefix = if safe_prefix.is_empty() || safe_prefix.contains("..") {
+        "IIS-Errors"
+    } else {
+        &safe_prefix
+    };
     let out_dir = PathBuf::from(output_dir);
-    let detail_csv = out_dir.join(format!("{}-{}.csv", report_prefix, run_stamp));
-    let summary_csv = out_dir.join(format!("{}-Summary-{}.csv", report_prefix, run_stamp));
-    let manifest_txt = out_dir.join(format!("{}-Manifest-{}.txt", report_prefix, run_stamp));
+    let detail_csv = out_dir.join(format!("{}-{}.csv", safe_prefix, run_stamp));
+    let summary_csv = out_dir.join(format!("{}-Summary-{}.csv", safe_prefix, run_stamp));
+    let manifest_txt = out_dir.join(format!("{}-Manifest-{}.txt", safe_prefix, run_stamp));
 
     {
         let mut wtr = csv::Writer::from_path(&detail_csv)?;
@@ -1060,8 +1154,9 @@ fn write_fleet_reports(
 
     let succeeded = summaries.iter().filter(|s| s.success).count();
     let manifest_content = format!(
-        "GeneratedUtc={}\nEngine=lpr-v1.3.0\nDays={}\nCutoffDate={}\nServersRequested={}\nServersSucceeded={}\nServersFailed={}\nTotalErrors={}\nDetailCsv={}\nSummaryCsv={}\nFailedServers={}\n",
+        "GeneratedUtc={}\nEngine=lpr-v{}\nDays={}\nCutoffDate={}\nServersRequested={}\nServersSucceeded={}\nServersFailed={}\nTotalErrors={}\nDetailCsv={}\nSummaryCsv={}\nFailedServers={}\n",
         Utc::now().to_rfc3339(),
+        env!("CARGO_PKG_VERSION"),
         days,
         cutoff_date,
         servers_requested,
@@ -1238,7 +1333,8 @@ fn parse_server_numbers(spec: &str) -> HashSet<usize> {
         }
         if let Some((a, b)) = tok.split_once('-') {
             if let (Ok(start), Ok(end)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
-                for n in start..=end {
+                let capped_end = end.min(start.saturating_add(10_000));
+                for n in start..=capped_end {
                     set.insert(n);
                 }
             }
@@ -1539,61 +1635,88 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 /// tears it down (`net use /delete`) when dropped. Windows only; no-op elsewhere.
 #[cfg(windows)]
 struct SmbSessionGuard {
-    target: String,
-    active: bool,
+    targets: Vec<String>,
 }
 
 #[cfg(windows)]
 impl SmbSessionGuard {
-    fn new(target: String, active: bool) -> Self {
-        Self { target, active }
+    fn new(targets: Vec<String>) -> Self {
+        Self { targets }
     }
 }
 
 #[cfg(windows)]
 impl Drop for SmbSessionGuard {
     fn drop(&mut self) {
-        if self.active {
+        for t in &self.targets {
             let _ = std::process::Command::new("net")
-                .args(["use", &self.target, "/delete", "/y"])
+                .args(["use", t, "/delete", "/y"])
                 .output();
         }
     }
 }
 
 #[cfg(windows)]
-fn establish_smb_session(srv: &ServerEntry, profile: &SavedProfile) -> SmbSessionGuard {
+fn is_safe_smb_ident(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.starts_with('/')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+}
+
+#[cfg(windows)]
+fn establish_smb_session(
+    srv: &ServerEntry,
+    profile: &SavedProfile,
+    resolved_pass: Option<&str>,
+) -> SmbSessionGuard {
     let Some(ref user) = profile.auth_user else {
-        return SmbSessionGuard::new(String::new(), false);
+        return SmbSessionGuard::new(Vec::new());
     };
-    let host = if srv.ip.trim().is_empty() {
-        srv.name.trim()
-    } else {
-        srv.ip.trim()
-    };
-    if host.is_empty() {
-        return SmbSessionGuard::new(String::new(), false);
+    let user_trimmed = user.trim();
+    if !is_safe_smb_ident(user_trimmed) {
+        eprintln!("  {SYM_WARN}  Invalid SMB username `{}` — skipping net use", user_trimmed);
+        return SmbSessionGuard::new(Vec::new());
     }
-    let full_user = match profile.auth_domain.as_deref().filter(|d| !d.trim().is_empty()) {
-        Some(dom) => format!("{}\\{}", dom.trim(), user.trim()),
-        None => user.trim().to_string(),
+    let full_user = match profile.auth_domain.as_deref().map(|d| d.trim()).filter(|d| !d.is_empty()) {
+        Some(dom) if is_safe_smb_ident(dom) => format!("{}\\{}", dom, user_trimmed),
+        Some(dom) => {
+            eprintln!("  {SYM_WARN}  Invalid SMB domain `{}` — skipping net use", dom);
+            return SmbSessionGuard::new(Vec::new());
+        }
+        None => user_trimmed.to_string(),
     };
-    let pass = resolve_secret(profile).unwrap_or_default();
-    let target = format!(r"\\{}\IPC$", host);
-    let out = std::process::Command::new("net")
-        .args([
-            "use",
-            &target,
-            &format!("/user:{}", full_user),
-            &pass,
-            "/persistent:no",
-        ])
-        .output();
-    let ok = out.map(|o| o.status.success()).unwrap_or(false);
-    if !ok {
-        eprintln!("  {SYM_WARN}  net use {} as {} failed — falling back to current credentials", target, full_user);
+    let pass = resolved_pass.unwrap_or("");
+    let mut active_targets = Vec::new();
+    for candidate in [srv.name.trim(), srv.ip.trim()] {
+        if !is_safe_smb_ident(candidate) {
+            continue;
+        }
+        let target = format!(r"\\{}\IPC$", candidate);
+        if active_targets.contains(&target) {
+            continue;
+        }
+        let out = std::process::Command::new("net")
+            .args([
+                "use",
+                &target,
+                &format!("/user:{}", full_user),
+                pass,
+                "/persistent:no",
+            ])
+            .output();
+        if out.map(|o| o.status.success()).unwrap_or(false) {
+            active_targets.push(target);
+        }
     }
-    SmbSessionGuard::new(target, ok)
+    if active_targets.is_empty() {
+        eprintln!(
+            "  {SYM_WARN}  net use \\\\{}\\IPC$ as {} failed — falling back to current session credentials",
+            srv.name, full_user
+        );
+    }
+    SmbSessionGuard::new(active_targets)
 }
 
 fn default_path_templates_for_stack(
@@ -1659,26 +1782,32 @@ fn parse_stack_input_format(server_type: &str) -> InputFormat {
 /// Builds a universal SQL query for `lpr fleet` that adapts automatically to IIS W3C (`sc_status`),
 /// Nginx/Apache/Tomcat (`status`), AWS ALB (`elb_status_code`), S3 (`http_status`), or Syslog/HAProxy (`message`).
 fn build_multi_format_error_sql(cols: &[String], status_prefix: &str, cutoff_date: &str) -> String {
+    let safe_status: String = status_prefix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let sp = if safe_status.is_empty() { "5" } else { &safe_status };
+    let safe_cutoff: String = cutoff_date
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
     let has = |c: &str| cols.iter().any(|x| x.eq_ignore_ascii_case(c));
     if has("sc_status") && has("date") {
         format!(
             "SELECT * FROM logs WHERE sc_status LIKE '{}%' AND date >= '{}' ORDER BY date, time",
-            status_prefix, cutoff_date
+            sp, safe_cutoff
         )
     } else if has("status") {
-        format!("SELECT * FROM logs WHERE CAST(status AS VARCHAR) LIKE '{}%'", status_prefix)
+        format!("SELECT * FROM logs WHERE CAST(status AS VARCHAR) LIKE '{}%'", sp)
     } else if has("elb_status_code") {
         format!(
             "SELECT * FROM logs WHERE elb_status_code LIKE '{}%' OR target_status_code LIKE '{}%'",
-            status_prefix, status_prefix
+            sp, sp
         )
     } else if has("http_status") {
-        format!("SELECT * FROM logs WHERE http_status LIKE '{}%'", status_prefix)
+        format!("SELECT * FROM logs WHERE http_status LIKE '{}%'", sp)
     } else if has("http_status_code") {
-        format!(
-            "SELECT * FROM logs WHERE http_status_code LIKE '{}%'",
-            status_prefix
-        )
+        format!("SELECT * FROM logs WHERE http_status_code LIKE '{}%'", sp)
     } else {
         "SELECT * FROM logs LIMIT 500".to_string()
     }
@@ -1766,6 +1895,17 @@ fn discover_local_linux_webserver_logs(site_query: &str) -> Vec<String> {
     paths
 }
 
+fn posix_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn is_safe_host_or_user(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
 /// Connects to a remote Linux/Unix web server over SSH, discovers & streams matching log lines
 /// (including `.gz` archives via `zcat -f`) from Nginx, Apache, Caddy, HAProxy, or Tomcat, and parses them with `lpr`.
 #[allow(clippy::too_many_arguments)]
@@ -1781,12 +1921,21 @@ async fn scan_linux_server_via_ssh(
     verbose: bool,
 ) -> Result<(Vec<FleetErrorRow>, usize, String)> {
     let target_host = if !srv.ip.is_empty() {
-        &srv.ip
+        srv.ip.trim()
     } else {
-        &srv.name
+        srv.name.trim()
     };
+    if !is_safe_host_or_user(target_host) {
+        anyhow::bail!("Unsafe SSH host identifier: {}", target_host);
+    }
     let ssh_target = match &profile.ssh_user {
-        Some(u) if !u.trim().is_empty() => format!("{}@{}", u.trim(), target_host),
+        Some(u) if !u.trim().is_empty() => {
+            let ut = u.trim();
+            if !is_safe_host_or_user(ut) {
+                anyhow::bail!("Unsafe SSH username: {}", ut);
+            }
+            format!("{}@{}", ut, target_host)
+        }
         _ => target_host.to_string(),
     };
 
@@ -1797,14 +1946,16 @@ async fn scan_linux_server_via_ssh(
                 .replace("{ip}", &srv.ip)
                 .replace("{site}", site_name)
         })
+        .filter(|d| !d.trim().is_empty())
         .collect();
+    let quoted_dirs: Vec<String> = search_dirs.iter().map(|d| posix_single_quote(d)).collect();
     let dirs_arg = search_dirs.join(" ");
 
-    // Build a fast remote shell command that auto-discovers Nginx/Apache vhost logs + searches log directories
+    // Build a POSIX-quoted remote shell command that prevents command injection
     let remote_cmd = format!(
         "find {} -maxdepth 2 -type f \\( -name '*.log' -o -name '*.log.1' -o -name '*access*.gz' \\) -mtime -{} 2>/dev/null | head -n 50 | xargs -r zcat -f 2>/dev/null",
-        dirs_arg,
-        days.max(1)
+        quoted_dirs.join(" "),
+        days.clamp(1, 3650)
     );
 
     let mut cmd = std::process::Command::new("ssh");
@@ -1816,11 +1967,12 @@ async fn scan_linux_server_via_ssh(
         cmd.arg("-p").arg(port.to_string());
     }
     if let Some(ref key_path) = profile.ssh_key {
-        if !key_path.trim().is_empty() {
-            cmd.arg("-i").arg(key_path.trim());
+        let kp = key_path.trim();
+        if !kp.is_empty() && !kp.starts_with('-') {
+            cmd.arg("-i").arg(kp);
         }
     }
-    cmd.arg(&ssh_target).arg(&remote_cmd);
+    cmd.arg("--").arg(&ssh_target).arg(&remote_cmd);
 
     let out = cmd.output()?;
     if !out.status.success() && out.stdout.is_empty() {
@@ -1832,7 +1984,16 @@ async fn scan_linux_server_via_ssh(
         return Ok((Vec::new(), 0, format!("ssh://{}:{}", ssh_target, dirs_arg)));
     }
 
-    let tmp_path = std::env::temp_dir().join(format!("lpr_ssh_{}.log", srv.name));
+    let safe_srv_tag: String = srv
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let tmp_path = std::env::temp_dir().join(format!(
+        "lpr_ssh_{}_{}.log",
+        safe_srv_tag,
+        std::process::id()
+    ));
     fs::write(&tmp_path, &out.stdout)?;
 
     let engine = LogEngine::with_options(threads, verbose);

@@ -79,7 +79,17 @@ pub async fn run_http_server(bind_addr: &str, default_source: Option<String>) ->
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    eprintln!("{SYM_ROCKET} lpr Studio v1.3.0 listening on http://{}", bind_addr);
+    eprintln!(
+        "{SYM_ROCKET} lpr Studio v{} listening on http://{}",
+        env!("CARGO_PKG_VERSION"),
+        bind_addr
+    );
+    if !bind_addr.starts_with("127.0.0.1") && !bind_addr.starts_with("localhost") && !bind_addr.starts_with("[::1]") {
+        eprintln!(
+            "{SYM_WARN}  Security Notice: Web Studio is bound to non-loopback address `{}` — anyone with network access can query local log files.",
+            bind_addr
+        );
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -124,7 +134,7 @@ async fn handle_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "samples/cloud_events.json",
     ];
     Json(serde_json::json!({
-        "version": "1.3.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "default_source": state.default_source.clone(),
         "samples": samples,
     }))

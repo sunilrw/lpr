@@ -3,8 +3,9 @@ use crate::parsers::{
     detect_format_item, get_format_regex, parse_aws_vpc_files, parse_azure_blob_files,
     parse_cef_files, parse_cisco_asa_files, parse_cisco_config_files, parse_evtx_files,
     parse_excel_files, parse_firewall_kv_files, parse_ias_files, parse_json_files,
-    parse_raw_items_parallel, parse_regex_items_parallel, parse_w3c_items_parallel, resolve_paths,
-    resolve_source_items, InputFormat, LogSourceItem, ParseStats,
+    parse_raw_items_parallel, parse_regex_items_parallel_filtered,
+    parse_w3c_items_parallel_filtered, resolve_paths, resolve_source_items, InputFormat,
+    LogSourceItem, ParseStats, ScanPreFilter,
 };
 use crate::udfs::register_all_udfs;
 use anyhow::Result;
@@ -320,6 +321,29 @@ impl LogEngine {
         ckpt: Option<&mut CheckpointStore>,
         path_pattern: Option<&str>,
     ) -> Result<InputFormat> {
+        self.register_source_items_filtered(
+            table_name,
+            items,
+            format,
+            custom_regex,
+            ckpt,
+            path_pattern,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_source_items_filtered(
+        &self,
+        table_name: &str,
+        items: Vec<LogSourceItem>,
+        format: InputFormat,
+        custom_regex: Option<&str>,
+        ckpt: Option<&mut CheckpointStore>,
+        path_pattern: Option<&str>,
+        pre_filter: Option<&ScanPreFilter>,
+    ) -> Result<InputFormat> {
         if items.is_empty() {
             anyhow::bail!("No log files remained after filtering");
         }
@@ -337,13 +361,15 @@ impl LogEngine {
 
         match effective_format {
             InputFormat::W3c => {
-                let (batches, s) = parse_w3c_items_parallel(&items, self.verbose)?;
+                let (batches, s) =
+                    parse_w3c_items_parallel_filtered(&items, self.verbose, pre_filter)?;
                 stats = s;
                 self.register_batches(table_name, batches)?;
             }
             InputFormat::Nginx | InputFormat::Syslog | InputFormat::AwsS3 | InputFormat::AwsAlb => {
                 let re = get_format_regex(effective_format).unwrap();
-                let (batches, s) = parse_regex_items_parallel(&items, re, self.verbose)?;
+                let (batches, s) =
+                    parse_regex_items_parallel_filtered(&items, re, self.verbose, pre_filter)?;
                 stats = s;
                 self.register_batches(table_name, batches)?;
             }
@@ -351,7 +377,8 @@ impl LogEngine {
                 let pattern = custom_regex
                     .ok_or_else(|| anyhow::anyhow!("--regex-pattern required for -i regex"))?;
                 let re = Regex::new(pattern)?;
-                let (batches, s) = parse_regex_items_parallel(&items, &re, self.verbose)?;
+                let (batches, s) =
+                    parse_regex_items_parallel_filtered(&items, &re, self.verbose, pre_filter)?;
                 stats = s;
                 self.register_batches(table_name, batches)?;
             }
