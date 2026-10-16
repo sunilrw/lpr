@@ -79,6 +79,17 @@ pub struct SavedProfile {
     pub output_format: Option<String>,
     #[serde(default)]
     pub verbose: Option<bool>,
+    /// Alternate credential username for remote SMB shares (combined with auth_domain)
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    #[serde(default)]
+    pub auth_domain: Option<String>,
+    /// Secret reference — `env:VAR_NAME`, `file:PATH`, or `prompt` (asks at scan time, never stored)
+    #[serde(default)]
+    pub auth_password_ref: Option<String>,
+    /// DPAPI-encrypted password blob (hex). Only decryptable by the same Windows user account on this machine.
+    #[serde(default)]
+    pub auth_password_enc: Option<String>,
     /// Inline server list saved directly inside the profile
     #[serde(default)]
     pub servers: Vec<ServerEntry>,
@@ -110,6 +121,10 @@ impl Default for SavedProfile {
             input_format: None,
             output_format: None,
             verbose: None,
+            auth_user: None,
+            auth_domain: None,
+            auth_password_ref: None,
+            auth_password_enc: None,
             servers: Vec::new(),
         }
     }
@@ -174,6 +189,10 @@ pub struct FleetScanConfig {
     pub ssh_user: Option<String>,
     pub ssh_key: Option<String>,
     pub ssh_port: Option<u16>,
+    pub auth_user: Option<String>,
+    pub auth_domain: Option<String>,
+    pub password_ref: Option<String>,
+    pub save_password: bool,
     pub output_dir: Option<String>,
     pub server_filter: Option<String>,
     pub server_numbers: Option<String>,
@@ -404,6 +423,28 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     if req.verbose {
         profile.verbose = Some(true);
     }
+    if let Some(ref au) = req.auth_user {
+        profile.auth_user = Some(au.clone());
+    }
+    if let Some(ref ad) = req.auth_domain {
+        profile.auth_domain = Some(ad.clone());
+    }
+    if let Some(ref pr) = req.password_ref {
+        profile.auth_password_ref = Some(pr.clone());
+    }
+    if req.save_password {
+        match prompt_and_encrypt_password() {
+            Ok(hex_blob) => {
+                profile.auth_password_enc = Some(hex_blob);
+                eprintln!("🔐 Password stored DPAPI-encrypted (bound to this Windows user account only).");
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️  --save-password could not store a secret here ({e}). Use --password-ref env:LPR_SMB_PASS, --password-ref file:<path>, or --password-ref prompt instead."
+                );
+            }
+        }
+    }
 
     // If `--save-profile <name>` was passed, persist the merged profile (including imported servers list if a CSV/JSON was given)
     if let Some(ref save_name) = req.save_profile_name {
@@ -608,6 +649,10 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         }
 
         let mut candidate_paths: Vec<String> = Vec::new();
+
+        // If alternate SMB credentials are configured, establish a `net use` IPC$ session first (Windows only).
+        #[cfg(windows)]
+        let _smb_guard = establish_smb_session(srv, &profile);
 
         // 1. Expand user-configured log_path / archive_path / path_templates (converting local D:\... to \\server\d$\... automatically!)
         for tpl in &path_templates {
@@ -1306,6 +1351,237 @@ fn extract_xml_attr(fragment: &str, attr_name: &str) -> Option<String> {
     let start = fragment.find(&needle)? + needle.len();
     let end = fragment[start..].find('"')?;
     Some(fragment[start..start + end].to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Credential handling — secret refs + Windows DPAPI-encrypted storage
+// ---------------------------------------------------------------------------
+
+/// Minimal raw FFI wrapper around CryptProtectData / CryptUnprotectData (DPAPI,
+/// CurrentUser scope) — no extra crate needed.
+#[cfg(windows)]
+mod dpapi {
+    use anyhow::Result;
+
+    #[repr(C)]
+    struct DataBlob {
+        cb_data: u32,
+        pb_data: *mut u8,
+    }
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptProtectData(
+            p_data_in: *const DataBlob,
+            sz_data_descr: *const u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut core::ffi::c_void,
+            p_prompt_struct: *const core::ffi::c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+        fn CryptUnprotectData(
+            p_data_in: *const DataBlob,
+            ppsz_data_descr: *mut *mut u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut core::ffi::c_void,
+            p_prompt_struct: *const core::ffi::c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(h_mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    pub fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+        unsafe {
+            let mut input = DataBlob {
+                cb_data: data.len() as u32,
+                pb_data: data.as_ptr() as *mut u8,
+            };
+            let mut output = DataBlob {
+                cb_data: 0,
+                pb_data: std::ptr::null_mut(),
+            };
+            if CryptProtectData(
+                &mut input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut output,
+            ) == 0
+            {
+                anyhow::bail!("CryptProtectData failed (win32 error)");
+            }
+            let slice = std::slice::from_raw_parts(output.pb_data, output.cb_data as usize);
+            let out = slice.to_vec();
+            LocalFree(output.pb_data as *mut core::ffi::c_void);
+            Ok(out)
+        }
+    }
+
+    pub fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+        unsafe {
+            let mut input = DataBlob {
+                cb_data: data.len() as u32,
+                pb_data: data.as_ptr() as *mut u8,
+            };
+            let mut output = DataBlob {
+                cb_data: 0,
+                pb_data: std::ptr::null_mut(),
+            };
+            if CryptUnprotectData(
+                &mut input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut output,
+            ) == 0
+            {
+                anyhow::bail!("CryptUnprotectData failed (wrong user/machine or corrupt blob)");
+            }
+            let slice = std::slice::from_raw_parts(output.pb_data, output.cb_data as usize);
+            let out = slice.to_vec();
+            LocalFree(output.pb_data as *mut core::ffi::c_void);
+            Ok(out)
+        }
+    }
+}
+
+#[allow(dead_code)] // used by Windows SMB session establishment; also resolves refs for `prompt` mode
+fn resolve_secret(profile: &SavedProfile) -> Option<String> {
+    #[cfg(windows)]
+    if let Some(ref hex_blob) = profile.auth_password_enc {
+        if let Ok(raw) = hex_decode(hex_blob) {
+            if let Ok(bytes) = dpapi::decrypt_data(&raw) {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    match profile.auth_password_ref.as_deref().map(|s| s.trim()) {
+        Some(r) if r.to_lowercase().starts_with("env:") => {
+            std::env::var(&r[4..]).ok().filter(|v| !v.is_empty())
+        }
+        Some(r) if r.to_lowercase().starts_with("file:") => fs::read_to_string(&r[5..])
+            .ok()
+            .and_then(|c| c.lines().next().map(|l| l.trim().to_string()))
+            .filter(|v| !v.is_empty()),
+        Some(r) if r.eq_ignore_ascii_case("prompt") => {
+            rpassword::prompt_password(format!(
+                "Enter password for {}: ",
+                profile.auth_user.as_deref().unwrap_or("remote share")
+            ))
+            .ok()
+            .filter(|v| !v.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// Prompt for a password (hidden input) and DPAPI-encrypt it for profile storage. Windows only.
+#[cfg(windows)]
+fn prompt_and_encrypt_password() -> Result<String> {
+    eprintln!("⚠️  The password will be DPAPI-encrypted and bound to THIS Windows user account on THIS machine only.");
+    eprintln!("⚠️  Other users / machines cannot decrypt it. If the account changes, re-save with --save-password.");
+    let pass = rpassword::prompt_password("Enter SMB password to encrypt: ")?;
+    if pass.is_empty() {
+        anyhow::bail!("empty password");
+    }
+    let blob = dpapi::encrypt_data(pass.as_bytes())?;
+    Ok(hex_encode(&blob))
+}
+
+#[cfg(not(windows))]
+fn prompt_and_encrypt_password() -> Result<String> {
+    anyhow::bail!("DPAPI encryption is Windows-only")
+}
+
+#[cfg(windows)]
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(windows)]
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        anyhow::bail!("invalid hex");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
+        .collect()
+}
+
+/// RAII guard: opens `net use \\server\IPC$` with alternate credentials on creation,
+/// tears it down (`net use /delete`) when dropped. Windows only; no-op elsewhere.
+#[cfg(windows)]
+struct SmbSessionGuard {
+    target: String,
+    active: bool,
+}
+
+#[cfg(windows)]
+impl SmbSessionGuard {
+    fn new(target: String, active: bool) -> Self {
+        Self { target, active }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SmbSessionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::process::Command::new("net")
+                .args(["use", &self.target, "/delete", "/y"])
+                .output();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn establish_smb_session(srv: &ServerEntry, profile: &SavedProfile) -> SmbSessionGuard {
+    let Some(ref user) = profile.auth_user else {
+        return SmbSessionGuard::new(String::new(), false);
+    };
+    let host = if srv.ip.trim().is_empty() {
+        srv.name.trim()
+    } else {
+        srv.ip.trim()
+    };
+    if host.is_empty() {
+        return SmbSessionGuard::new(String::new(), false);
+    }
+    let full_user = match profile.auth_domain.as_deref().filter(|d| !d.trim().is_empty()) {
+        Some(dom) => format!("{}\\{}", dom.trim(), user.trim()),
+        None => user.trim().to_string(),
+    };
+    let pass = resolve_secret(profile).unwrap_or_default();
+    let target = format!(r"\\{}\IPC$", host);
+    let out = std::process::Command::new("net")
+        .args([
+            "use",
+            &target,
+            &format!("/user:{}", full_user),
+            &pass,
+            "/persistent:no",
+        ])
+        .output();
+    let ok = out.map(|o| o.status.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("  ⚠️  net use {} as {} failed — falling back to current credentials", target, full_user);
+    }
+    SmbSessionGuard::new(target, ok)
 }
 
 fn default_path_templates_for_stack(

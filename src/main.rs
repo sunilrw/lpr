@@ -309,6 +309,22 @@ enum Commands {
         #[arg(long = "ssh-port", value_name = "PORT")]
         ssh_port: Option<u16>,
 
+        /// Alternate SMB username for remote Windows shares (e.g. "svc-logreader")
+        #[arg(long = "user", value_name = "USER")]
+        auth_user: Option<String>,
+
+        /// SMB domain/workgroup for the alternate user (e.g. "CORP" or "SERVER01")
+        #[arg(long = "domain", value_name = "DOMAIN")]
+        auth_domain: Option<String>,
+
+        /// Password source — env:VAR_NAME | file:PATH | prompt (never stores plaintext)
+        #[arg(long = "password-ref", value_name = "env:VAR|file:PATH|prompt")]
+        password_ref: Option<String>,
+
+        /// Prompt for a password and store it DPAPI-encrypted in the profile (Windows only, bound to this user account)
+        #[arg(long = "save-password")]
+        save_password: bool,
+
         /// Semicolon-separated log path templates supporting {server}, {ip}, {site} (e.g. "\\\\{server}\\d$\\Logs\\{site}")
         #[arg(long = "path-template", value_name = "TEMPLATE")]
         path_template: Option<String>,
@@ -823,6 +839,10 @@ async fn main() -> Result<()> {
             ssh_user,
             ssh_key,
             ssh_port,
+            auth_user,
+            auth_domain,
+            password_ref,
+            save_password,
             path_template,
             output,
             server_filter,
@@ -850,6 +870,10 @@ async fn main() -> Result<()> {
                 ssh_user,
                 ssh_key,
                 ssh_port,
+                auth_user,
+                auth_domain,
+                password_ref,
+                save_password,
                 output_dir: output,
                 server_filter,
                 server_numbers,
