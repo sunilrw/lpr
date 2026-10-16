@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 *.parquet
 *.checkpoint.json
 lpr.config.json

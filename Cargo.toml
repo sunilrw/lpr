@@ -19,7 +19,7 @@ anyhow = "1.0"
 regex = "1.11"
 flate2 = "1.0"
 zstd = "0.13"
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 rayon = "1.10"
 evtx = "0.8"
 calamine = "0.26"
