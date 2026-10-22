@@ -44,10 +44,14 @@ pub fn get_ascii_banner() -> String {
 #[command(
     name = "lpr",
     version = LPR_VERSION,
+    disable_version_flag = true,
     about = "Modern Multi-Threaded Rust SQL Log Parser & Security Auditor (Log Parser 2.2 + Linux + .NET/PS + REST API + MCP)",
     long_about = "High-performance vectorized & multi-threaded log engine powered by Apache Arrow, DataFusion & Rayon.\nReads uncompressed logs, .zip archives, .gz, and .zst streams directly across CPU cores.\nSupports ANSI SQL, Microsoft Log Parser 2.2 syntax (`-i:IISW3C`, `SELECT TOP 10 ... INTO out.csv FROM *.log`), Linux CLI filters (`-g`, `-v`, `-F`, `--stats`, `stdin` pipes), .NET/PowerShell integration (`lpr sdk`), HTTP REST API (`lpr serve`), and AI MCP (`lpr mcp`)."
 )]
 struct Cli {
+    /// Print version information
+    #[arg(long = "version", action = clap::ArgAction::Version)]
+    version: Option<bool>,
     /// ANSI SQL, Microsoft Log Parser 2.2 query, or lnav filter (`:filter-in <pat>`)
     #[arg(value_name = "SQL_QUERY")]
     query: Option<String>,
@@ -87,6 +91,18 @@ struct Cli {
     /// List all saved profiles in lpr.config.json
     #[arg(long = "list-profiles", global = true)]
     list_profiles: bool,
+
+    /// List all saved commands in lpr.config.json (up to 100 unique commands)
+    #[arg(short = 'H', long = "history", global = true)]
+    history: bool,
+
+    /// Rerun a saved command by its 1-based history number (e.g. `--rerun 33`, `--rerun last`, or `!33`)
+    #[arg(long = "rerun", alias = "run-history", global = true, value_name = "NUMBER_OR_LAST")]
+    rerun: Option<String>,
+
+    /// Browse saved commands interactively with DOS-style Up/Down arrows and press Enter to run
+    #[arg(long = "browse-history", alias = "doskey", global = true)]
+    browse_history: bool,
 
     /// Enable detailed per-file verbose progress logging (shows each file, lines, rows, and parse time)
     #[arg(short = 'V', long = "verbose", global = true)]
@@ -381,6 +397,30 @@ enum Commands {
         #[arg(long = "set-default", value_name = "PROFILE_NAME")]
         set_default: Option<String>,
     },
+
+    /// List, search, browse (DOS Up/Down arrows), or rerun up to 100 unique commands saved in lpr.config.json
+    #[command(alias = "hist", alias = "rerun")]
+    History {
+        /// Optional command number to rerun immediately (e.g. `33` or `last`) or search text
+        #[arg(value_name = "NUMBER_OR_SEARCH")]
+        target: Option<String>,
+
+        /// Browse saved commands interactively with DOS-style Up/Down arrows and press Enter to execute
+        #[arg(short = 'i', long = "interactive", alias = "browse")]
+        interactive: bool,
+
+        /// Explicitly rerun a saved command by its 1-based number (e.g. `-r 33`)
+        #[arg(short = 'r', long = "run", value_name = "NUMBER")]
+        run_num: Option<usize>,
+
+        /// Filter saved commands by keyword
+        #[arg(short = 's', long = "search", value_name = "KEYWORD")]
+        search: Option<String>,
+
+        /// Clear saved command history in lpr.config.json
+        #[arg(long = "clear")]
+        clear: bool,
+    },
 }
 
 fn preprocess_cli_args<I: IntoIterator<Item = String>>(raw_args: I) -> Vec<String> {
@@ -411,6 +451,16 @@ fn preprocess_cli_args<I: IntoIterator<Item = String>>(raw_args: I) -> Vec<Strin
         } else if lower == "--log" {
             out.push("--log-file".to_string());
             out.push("lpr_execution.log".to_string());
+        } else if lower == "!!" {
+            out.push("--rerun".to_string());
+            out.push("last".to_string());
+        } else if let Some(num) = arg.strip_prefix('!') {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                out.push("--rerun".to_string());
+                out.push(num.to_string());
+            } else {
+                out.push(arg);
+            }
         } else if lower.starts_with("-e:")
             || lower.starts_with("/e:")
             || lower.starts_with("-iw:")
@@ -763,9 +813,40 @@ async fn run_goaccess_stats(engine: &LogEngine, file_pattern: &str, fmt: InputFo
     Ok(())
 }
 
+fn resolve_history_rerun_args(
+    cfg_file: Option<&str>,
+    target_spec: &str,
+) -> Result<(usize, Vec<String>, String)> {
+    let store = fleet::LprConfigFile::load(cfg_file);
+    if store.command_history.is_empty() {
+        anyhow::bail!("No saved commands in history yet (`lpr.config.json`).");
+    }
+    let idx = if target_spec.eq_ignore_ascii_case("last") || target_spec == "-1" {
+        store.command_history.len() - 1
+    } else {
+        let num: usize = target_spec.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid history command number `{}`. Run `lpr history` to see valid command numbers (1..={}).",
+                target_spec,
+                store.command_history.len()
+            )
+        })?;
+        if num == 0 || num > store.command_history.len() {
+            anyhow::bail!(
+                "Command number {} is out of range (saved history has 1..={}). Run `lpr history` to list all.",
+                num,
+                store.command_history.len()
+            );
+        }
+        num - 1
+    };
+    let entry = &store.command_history[idx];
+    Ok((idx + 1, entry.args.clone(), entry.command_line.clone()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let raw_args: Vec<String> = std::env::args().collect();
+    let mut raw_args: Vec<String> = std::env::args().collect();
 
     // If invoked with zero arguments, show banner + quick-start + help
     if raw_args.len() <= 1 {
@@ -777,6 +858,7 @@ async fn main() -> Result<()> {
         let _ = writeln!(out, "  • Linux grep / awk:     lpr -f samples/iis/u_extend01.log -g 500 -F date,time,c_ip,cs_uri_stem,sc_status");
         let _ = writeln!(out, "  • GoAccess Summary:     lpr -f samples/iis/u_extend01.log --stats");
         let _ = writeln!(out, "  • Fleet Server Scanner: lpr fleet --save-profile prod-web --servers servers.csv --site W3SVC1 --threads 8");
+        let _ = writeln!(out, "  • Command History/DOS:  lpr history   |   lpr --rerun 33   |   lpr history -i (Up/Down Arrows)");
         let _ = writeln!(out, "  • Smart SQL Intents:    lpr suggest samples/iis/u_extend01.log");
         let _ = writeln!(out, "  • PowerShell / .NET C#: lpr sdk");
         let _ = writeln!(out, "  • Launch Web Studio:    lpr serve");
@@ -786,10 +868,100 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let processed_args = preprocess_cli_args(raw_args);
-    let cli = Cli::parse_from(processed_args);
+    let mut processed_args = preprocess_cli_args(raw_args.clone());
+    let mut cli = Cli::parse_from(processed_args);
     if cli.ascii {
         sym::force_ascii();
+    }
+
+    // Handle history listing, interactive DOS Up/Down arrow browsing, or rerunning command #N
+    let mut rerun_args_opt: Option<Vec<String>> = None;
+
+    if cli.browse_history {
+        if let Some(chosen) = fleet::browse_command_history_interactive(cli.cfg_file.as_deref())? {
+            eprintln!(
+                "{SYM_ZAP} Rerunning selected command: {}",
+                fleet::LprConfigFile::format_command_line(&chosen)
+            );
+            rerun_args_opt = Some(chosen);
+        } else {
+            return Ok(());
+        }
+    } else if let Some(ref spec) = cli.rerun {
+        let (num, args, cmd_str) = resolve_history_rerun_args(cli.cfg_file.as_deref(), spec)?;
+        eprintln!("{SYM_ZAP} Rerunning history command [{}]: {}", num, cmd_str);
+        rerun_args_opt = Some(args);
+    } else if cli.history {
+        fleet::print_command_history(cli.cfg_file.as_deref(), None);
+        return Ok(());
+    } else if let Some(Commands::History {
+        ref target,
+        interactive,
+        run_num,
+        ref search,
+        clear,
+    }) = cli.command
+    {
+        if clear {
+            let mut store = fleet::LprConfigFile::load(cli.cfg_file.as_deref());
+            store.command_history.clear();
+            let p = store.save(cli.cfg_file.as_deref())?;
+            println!(
+                "{SYM_DONE} Cleared saved command history in `{}`",
+                p.to_string_lossy()
+            );
+            return Ok(());
+        }
+        if interactive {
+            if let Some(chosen) = fleet::browse_command_history_interactive(cli.cfg_file.as_deref())?
+            {
+                eprintln!(
+                    "{SYM_ZAP} Rerunning selected command: {}",
+                    fleet::LprConfigFile::format_command_line(&chosen)
+                );
+                rerun_args_opt = Some(chosen);
+            } else {
+                return Ok(());
+            }
+        } else if let Some(n) = run_num {
+            let (num, args, cmd_str) =
+                resolve_history_rerun_args(cli.cfg_file.as_deref(), &n.to_string())?;
+            eprintln!("{SYM_ZAP} Rerunning history command [{}]: {}", num, cmd_str);
+            rerun_args_opt = Some(args);
+        } else if let Some(ref t) = target {
+            if t.eq_ignore_ascii_case("last") || t.chars().all(|c| c.is_ascii_digit()) {
+                let (num, args, cmd_str) = resolve_history_rerun_args(cli.cfg_file.as_deref(), t)?;
+                eprintln!("{SYM_ZAP} Rerunning history command [{}]: {}", num, cmd_str);
+                rerun_args_opt = Some(args);
+            } else {
+                fleet::print_command_history(cli.cfg_file.as_deref(), Some(t));
+                return Ok(());
+            }
+        } else {
+            fleet::print_command_history(cli.cfg_file.as_deref(), search.as_deref());
+            return Ok(());
+        }
+    }
+
+    if let Some(chosen_args) = rerun_args_opt {
+        let mut rebuilt = vec![raw_args[0].clone()];
+        rebuilt.extend(chosen_args);
+        raw_args = rebuilt;
+        processed_args = preprocess_cli_args(raw_args.clone());
+        cli = Cli::parse_from(processed_args);
+    }
+
+    // Record every executed command (up to 100 unique commands; duplicates move to latest; oldest > 100 evicted)
+    let is_meta_only = cli.list_profiles
+        || matches!(
+            cli.command,
+            Some(Commands::Config { .. })
+                | Some(Commands::History { .. })
+                | Some(Commands::HelpFull)
+                | Some(Commands::Sdk { .. })
+        );
+    if !is_meta_only && raw_args.len() > 1 {
+        fleet::LprConfigFile::record_command_execution(cli.cfg_file.as_deref(), &raw_args[1..]);
     }
 
     match cli.command {
@@ -913,6 +1085,9 @@ async fn main() -> Result<()> {
                 verbose: cli.verbose,
             };
             return fleet::run_fleet_scan(cfg).await;
+        }
+        Some(Commands::History { .. }) => {
+            return Ok(());
         }
         None => {}
     }

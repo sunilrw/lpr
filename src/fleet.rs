@@ -12,15 +12,27 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Persistent configuration store (`lpr.config.json`) supporting named profiles.
+/// Persistent configuration store (`lpr.config.json`) supporting named profiles and command history.
 /// Zero hardcoded client names, paths, or servers — users save their own profiles once via `--save-profile <name>`
-/// and reuse them anytime via `--profile <name>`.
+/// and reuse them anytime via `--profile <name>`. Also stores up to 100 recently executed CLI commands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LprConfigFile {
     #[serde(default = "default_profile_name")]
     pub default_profile: String,
     #[serde(default)]
     pub profiles: BTreeMap<String, SavedProfile>,
+    #[serde(default)]
+    pub command_history: Vec<CommandHistoryEntry>,
+}
+
+pub const MAX_COMMAND_HISTORY: usize = 100;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandHistoryEntry {
+    pub timestamp: String,
+    pub cwd: String,
+    pub args: Vec<String>,
+    pub command_line: String,
 }
 
 fn default_profile_name() -> String {
@@ -182,6 +194,53 @@ impl LprConfigFile {
             let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         }
         Ok(path)
+    }
+
+    pub fn format_command_line(args: &[String]) -> String {
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push("lpr".to_string());
+        for a in args {
+            if a.contains(' ') || a.contains('\t') || a.contains('"') || a.contains('\'') || a.contains('*') {
+                let escaped = a.replace('"', "\\\"");
+                parts.push(format!("\"{}\"", escaped));
+            } else {
+                parts.push(a.clone());
+            }
+        }
+        parts.join(" ")
+    }
+
+    pub fn record_command_execution(explicit: Option<&str>, args_without_bin: &[String]) {
+        if args_without_bin.is_empty() {
+            return;
+        }
+        let mut store = Self::load(explicit);
+        let cmd_line = Self::format_command_line(args_without_bin);
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let ts = Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+
+        // Keep only unique commands: remove any existing entry with the exact same args/command_line
+        // so the newly executed one replaces it at the latest position.
+        store
+            .command_history
+            .retain(|entry| entry.args != args_without_bin && entry.command_line != cmd_line);
+
+        store.command_history.push(CommandHistoryEntry {
+            timestamp: ts,
+            cwd,
+            args: args_without_bin.to_vec(),
+            command_line: cmd_line,
+        });
+
+        // Cap at MAX_COMMAND_HISTORY (100): evict the oldest command(s) when over 100
+        if store.command_history.len() > MAX_COMMAND_HISTORY {
+            let excess = store.command_history.len() - MAX_COMMAND_HISTORY;
+            store.command_history.drain(0..excess);
+        }
+
+        let _ = store.save(explicit);
     }
 }
 
@@ -348,7 +407,274 @@ pub fn print_saved_profiles(cfg_file_path: Option<&str>) {
             );
         }
     }
+    if !store.command_history.is_empty() {
+        println!("\n  {SYM_TIP} Saved Command History: {} unique command(s) in `{}`", store.command_history.len(), path.to_string_lossy());
+        println!("     • List all:      lpr history");
+        println!("     • Rerun #N:      lpr --rerun 1   (or `lpr history 33`)");
+        println!("     • Arrow Browse:  lpr history -i  (Up/Down arrows + Enter to run)");
+    }
     println!();
+}
+
+pub fn print_command_history(cfg_file_path: Option<&str>, filter: Option<&str>) {
+    let path = LprConfigFile::resolve_config_path(cfg_file_path);
+    let store = LprConfigFile::load(cfg_file_path);
+    println!("================================================================================");
+    println!(
+        " {SYM_LIST} LPR SAVED COMMAND HISTORY ({} / max {} unique commands in `{}`)",
+        store.command_history.len(),
+        MAX_COMMAND_HISTORY,
+        path.to_string_lossy()
+    );
+    println!("================================================================================");
+    if store.command_history.is_empty() {
+        println!("  No commands saved in history yet.");
+        println!("  Every command you run is automatically saved here (up to 100 unique commands).");
+        return;
+    }
+
+    let needle = filter.map(|s| s.to_lowercase());
+    for (idx, entry) in store.command_history.iter().enumerate() {
+        let num = idx + 1;
+        if let Some(ref pat) = needle {
+            if !entry.command_line.to_lowercase().contains(pat)
+                && !entry.cwd.to_lowercase().contains(pat)
+            {
+                continue;
+            }
+        }
+        println!(
+            "  [{:>3}] {}  ({} | dir: {})",
+            num, entry.command_line, entry.timestamp, entry.cwd
+        );
+    }
+    println!("--------------------------------------------------------------------------------");
+    println!(" {SYM_TIP} Rerun by number : `lpr --rerun 33`  or  `lpr history 33`  or  `lpr !33`");
+    println!(" {SYM_TIP} Rerun last      : `lpr --rerun last` or  `lpr !!`");
+    println!(" {SYM_TIP} DOS Up/Down UI  : `lpr history -i`  (browse with ↑/↓ arrows, Enter to execute)");
+    println!("================================================================================");
+}
+
+/// Interactive DOS-style Up/Down arrow command browser in the terminal.
+/// Returns `Ok(Some(args))` if the user pressed Enter on a command to execute it.
+pub fn browse_command_history_interactive(cfg_file_path: Option<&str>) -> Result<Option<Vec<String>>> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEventKind},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    use ratatui::{
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+        Terminal,
+    };
+    use std::io;
+
+    let path = LprConfigFile::resolve_config_path(cfg_file_path);
+    let mut store = LprConfigFile::load(cfg_file_path);
+    if store.command_history.is_empty() {
+        println!("No saved commands in `{}` yet.", path.to_string_lossy());
+        return Ok(None);
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Start at the most recent command (bottom of list), just like DOSKEY / Up-Arrow!
+    let mut selected: usize = store.command_history.len().saturating_sub(1);
+    let mut filter_text = String::new();
+    let mut chosen_args: Option<Vec<String>> = None;
+
+    loop {
+        let filtered_indices: Vec<usize> = store
+            .command_history
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                filter_text.is_empty()
+                    || e.command_line
+                        .to_lowercase()
+                        .contains(&filter_text.to_lowercase())
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if !filtered_indices.is_empty() && selected >= filtered_indices.len() {
+            selected = filtered_indices.len() - 1;
+        }
+
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(8),
+                    Constraint::Length(5),
+                ])
+                .split(f.area());
+
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " LPR COMMAND HISTORY BROWSER ",
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "  [↑/↓ or PgUp/PgDn] Browse  [Enter] Run Command  [Del] Remove  [Type] Filter: `{}`  [Esc] Cancel",
+                    filter_text
+                )),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " Config: {} ({}/{} unique commands) ",
+                path.to_string_lossy(),
+                store.command_history.len(),
+                MAX_COMMAND_HISTORY
+            )));
+            f.render_widget(header, chunks[0]);
+
+            let items: Vec<ListItem> = filtered_indices
+                .iter()
+                .map(|&orig_idx| {
+                    let entry = &store.command_history[orig_idx];
+                    let num = orig_idx + 1;
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!(" [{:>3}] ", num),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(&entry.command_line, Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("   ({} | {})", entry.timestamp, entry.cwd),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                })
+                .collect();
+
+            let mut list_state = ListState::default();
+            if !filtered_indices.is_empty() {
+                list_state.select(Some(selected));
+            }
+
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Saved Commands (Oldest -> Newest; starts at Latest like DOS Up-Arrow) "),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▶ ");
+            f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+            let detail_text = if let Some(&orig_idx) = filtered_indices.get(selected) {
+                let entry = &store.command_history[orig_idx];
+                vec![
+                    Line::from(vec![
+                        Span::styled(" Selected Command (#", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("{}", orig_idx + 1),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("): ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            &entry.command_line,
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(format!(
+                        " Last Ran: {}   |   Folder: {}   |   Direct CLI Rerun: `lpr --rerun {}`",
+                        entry.timestamp,
+                        entry.cwd,
+                        orig_idx + 1
+                    )),
+                ]
+            } else {
+                vec![Line::from(" No matching commands.")]
+            };
+
+            let footer = Paragraph::new(detail_text)
+                .block(Block::default().borders(Borders::ALL).title(" Command Details (Press Enter to Execute Now) "));
+            f.render_widget(footer, chunks[2]);
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Esc => break,
+                    KeyCode::Up => {
+                        if selected > 0 {
+                            selected -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if selected + 1 < filtered_indices.len() {
+                            selected += 1;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        selected = selected.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        if !filtered_indices.is_empty() {
+                            selected = (selected + 10).min(filtered_indices.len() - 1);
+                        }
+                    }
+                    KeyCode::Home => {
+                        selected = 0;
+                    }
+                    KeyCode::End => {
+                        if !filtered_indices.is_empty() {
+                            selected = filtered_indices.len() - 1;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if let Some(&orig_idx) = filtered_indices.get(selected) {
+                            store.command_history.remove(orig_idx);
+                            let _ = store.save(cfg_file_path);
+                            if store.command_history.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(&orig_idx) = filtered_indices.get(selected) {
+                            chosen_args = Some(store.command_history[orig_idx].args.clone());
+                            break;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        filter_text.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        if c == 'q' && filter_text.is_empty() {
+                            break;
+                        }
+                        filter_text.push(c);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(chosen_args)
 }
 
 pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {

@@ -1,4 +1,4 @@
-# 🛡️ LPR (Log Parser Rust) v1.4.1
+# 🛡️ LPR (Log Parser Rust) v1.4.2
 
 **Modern Multi-Threaded Rust SQL Log Engine, Fleet Error Scanner & Automated Security Auditor**  
 *Powered by Apache Arrow 53, DataFusion 42 & Rayon Parallel Engine*  
@@ -81,6 +81,31 @@ lpr.exe fleet --save-profile prod-iis --servers servers.csv --site W3SVC4 --thre
 
 :: Change which saved profile runs by default when you type `lpr.exe fleet`
 lpr.exe config --set-default prod-iis
+```
+
+### D. Persistent Command History (Max 100 Unique Commands, Numbered Rerun & DOS Up/Down Browser)
+Every command you run is automatically saved into `lpr.config.json` (`command_history`, up to **100 unique commands**).
+- If you run the **exact same command** again, `lpr` removes the old duplicate and keeps only the new one at the latest position (only unique commands are stored).
+- When the history reaches 100 commands, the oldest command is automatically removed.
+
+```cmd
+:: 1. List all saved commands (1..100) with timestamps and folder paths
+lpr.exe history
+lpr.exe -H
+
+:: 2. Rerun a specific command by its number (e.g. #33) or rerun the last command
+lpr.exe --rerun 33
+lpr.exe history 33
+lpr.exe !33
+lpr.exe --rerun last
+
+:: 3. Browse old commands with DOS-style Up/Down arrows and press Enter to execute
+lpr.exe history -i
+lpr.exe --browse-history
+
+:: 4. Filter saved commands by keyword or clear history
+lpr.exe history 500
+lpr.exe history --clear
 ```
 
 ---
