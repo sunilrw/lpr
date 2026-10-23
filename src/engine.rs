@@ -130,6 +130,10 @@ pub fn normalize_logparser_sql(sql: &str, known_columns: &[String]) -> String {
 
     let (mut working, _) = extract_source_from_sql(sql);
 
+    // 0. Translate Natural English queries or Hybrid SQL+English grammar & glob wildcards (`LIKE '/cat*'`)
+    let initial_nl = crate::nl2sql::translate_natural_or_hybrid_sql(&working, known_columns);
+    working = initial_nl.sql;
+
     // 1. Convert [col-name] bracket identifiers
     working = BRACKET_IDENT_RE
         .replace_all(&working, |caps: &regex::Captures| {
@@ -186,14 +190,17 @@ pub fn normalize_logparser_sql(sql: &str, known_columns: &[String]) -> String {
 
     let replaced = replace_outside_single_quotes(&working, &w3c_candidates);
     // 4. Rewrite LOWER(col) LIKE 'pat' / UPPER(col) LIKE 'pat' -> col ILIKE 'pat' to avoid allocating lowercase StringArrays
-    LOWER_UPPER_LIKE_RE
+    let ilike_rewritten = LOWER_UPPER_LIKE_RE
         .replace_all(&replaced, |caps: &regex::Captures| {
             let col = &caps[1];
             let not_kw = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let pat = &caps[3];
             format!("{} {}ILIKE {}", col, not_kw, pat)
         })
-        .into_owned()
+        .into_owned();
+
+    // 5. Final pass to map any normalized W3C column names to mixed-case CSV columns (e.g. UriStem -> "UriStem")
+    crate::nl2sql::translate_natural_or_hybrid_sql(&ilike_rewritten, known_columns).sql
 }
 
 pub fn build_universal_search_predicate(
@@ -500,16 +507,19 @@ impl LogEngine {
         let normalized = normalize_logparser_sql(sql, &cols);
         let df = match self.ctx.sql(&normalized).await {
             Ok(df) => df,
-            Err(_) => self
-                .ctx
-                .sql(sql)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", format_helpful_error(&e.to_string(), None, &cols)))?,
+            Err(_) => self.ctx.sql(sql).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    format_helpful_error_with_sql(&e.to_string(), None, &cols, Some(sql))
+                )
+            })?,
         };
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", format_helpful_error(&e.to_string(), None, &cols)))?;
+        let batches = df.collect().await.map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                format_helpful_error_with_sql(&e.to_string(), None, &cols, Some(sql))
+            )
+        })?;
         Ok(batches)
     }
 
@@ -551,6 +561,15 @@ pub fn format_helpful_error(
     source_hint: Option<&str>,
     available_cols: &[String],
 ) -> String {
+    format_helpful_error_with_sql(raw_msg, source_hint, available_cols, None)
+}
+
+pub fn format_helpful_error_with_sql(
+    raw_msg: &str,
+    source_hint: Option<&str>,
+    available_cols: &[String],
+    original_sql: Option<&str>,
+) -> String {
     let cleaned = raw_msg.trim();
     // Avoid double-wrapping if already formatted
     if cleaned.contains("HOW TO SOLVE IT:") {
@@ -561,6 +580,17 @@ pub fn format_helpful_error(
     let src_display = source_hint
         .map(clean_windows_path)
         .unwrap_or_else(|| "<your-log-or-csv-path>".to_string());
+
+    let auto_suggest_block = original_sql
+        .and_then(|q| crate::nl2sql::suggest_sql_autocorrect(q, available_cols))
+        .map(|sug| {
+            format!(
+                "\n💡 DID YOU MEAN:\n  {}\n  (Auto-corrected: {})\n  --> Press [Y] or [Enter] to run the auto-corrected query!",
+                sug.corrected_sql,
+                sug.changes.join(", ")
+            )
+        })
+        .unwrap_or_default();
 
     // 1. Table 'logs' not found (no file loaded yet or wrong table name in FROM)
     if lower.contains("table 'datafusion.public.") && lower.contains("not found") {
@@ -596,16 +626,39 @@ pub fn format_helpful_error(
         } else {
             available_cols.join(", ")
         };
+        // Even if original_sql wasn't passed, try extracting the misspelled field from `No field named <col>.`
+        let fallback_col_hint = if auto_suggest_block.is_empty() {
+            if let Some(idx) = lower.find("no field named ") {
+                let after = &cleaned[idx + "no field named ".len()..];
+                let bad_tok = after
+                    .split(|c: char| c == '.' || c.is_whitespace() || c == '"' || c == '\'')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("");
+                if let Some((closest, _)) = crate::nl2sql::find_closest_column(bad_tok, available_cols) {
+                    format!(
+                        "\n💡 DID YOU MEAN COLUMN: `{}` (instead of `{}`)?",
+                        closest, bad_tok
+                    )
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            auto_suggest_block.clone()
+        };
         return format!(
-            "{}\n\
+            "{}{}\n\
              WHAT IS WRONG:\n  \
                The SQL query referenced a column name that does not exist in the currently loaded file (`{}`).\n\
              AVAILABLE COLUMNS IN THIS FILE ({}):\n  \
                {}\n\
              HOW TO SOLVE IT:\n  \
                • Replace the missing column in your `SELECT` / `WHERE` clause with one of the available columns listed above.\n  \
-               • Or run `SELECT * FROM logs LIMIT 50` to inspect all columns in this file.",
+               • Or type plain English (e.g. `find unique user agent from todays logs` or `SELECT * FROM logs where url starts with /cat`).",
             cleaned,
+            fallback_col_hint,
             src_display,
             available_cols.len(),
             cols_preview
@@ -637,15 +690,16 @@ pub fn format_helpful_error(
     // 4. SQL parser syntax error
     if lower.contains("sql parser error") || lower.contains("expected:") {
         return format!(
-            "{}\n\
+            "{}{}\n\
              WHAT IS WRONG:\n  \
-               The SQL query has a syntax error.\n\
+               The query has a SQL syntax error or an unrecognized keyword.\n\
              HOW TO SOLVE IT:\n  \
                • Enclose string literals and `LIKE` patterns in single quotes (`'...'`), e.g.:\n    \
                  SELECT * FROM logs WHERE sc_status = '500' AND cs_uri_stem LIKE '%/api/%' LIMIT 50\n  \
-               • Wrap column names containing special characters in square brackets (`[cs-uri-stem]`) or use underscores (`cs_uri_stem`).\n  \
-               • Run `lpr help-full` (or press `F1` in TUI) to see copy-pasteable SQL examples.",
-            cleaned
+               • Or type plain English directly — `lpr` translates English grammar to SQL automatically (no AI needed):\n    \
+                 find unique user agent from todays logs\n    \
+                 SELECT * FROM logs where url starts with /cat and status is 500",
+            cleaned, auto_suggest_block
         );
     }
 
@@ -656,12 +710,13 @@ pub fn format_helpful_error(
         String::new()
     };
     format!(
-        "{}{}\n\
+        "{}{}{}\n\
          HOW TO SOLVE IT:\n  \
            • Try running `SELECT * FROM logs LIMIT 50` first to verify the loaded columns and data.\n  \
            • Run `lpr suggest \"{}\"` to get ready-to-run SQL queries tailored to this file.\n  \
+           • You can also type plain English queries such as `find unique user agent from todays logs`.\n  \
            • Run `lpr help-full` or `lpr --help` for complete parameter & SQL syntax examples.",
-        cleaned, cols_note, src_display
+        cleaned, auto_suggest_block, cols_note, src_display
     )
 }
 

@@ -1,6 +1,6 @@
-# 🛡️ LPR (Log Parser Rust) v1.4.3
+# 🛡️ LPR (Log Parser Rust) v1.4.5
 
-**Modern Multi-Threaded Rust SQL Log Engine, Fleet Error Scanner & Automated Security Auditor**  
+**Modern Multi-Threaded Rust SQL Log Engine, Plain-English Query Compiler, Fleet Error Scanner & Automated Security Auditor**  
 *Powered by Apache Arrow 53, DataFusion 42 & Rayon Parallel Engine*  
 ✨ **Made using vibe coding by Sunil Warrier**
 
@@ -20,6 +20,31 @@
 | **macOS** | `target/release/lpr` | Native Apple Silicon executable |
 | **Sample Log Files** | `samples/` | Ready-to-run sample logs (`iis/`, `nginx_access.log`, `firewall.log`, `cisco_switch.cfg`, `cloud_events.json`) |
 | **200+ Query Cookbook** | [`docs/SAMPLE_QUERIES.md`](docs/SAMPLE_QUERIES.md) | Complete cookbook of 200+ SQL recipes across 22 categories |
+
+---
+
+## ✨ What's New in v1.4.5 — Plain-English Grammar to SQL (Zero AI) & "Did You Mean...?" Auto-Correct
+
+`lpr` v1.4.5 includes a built-in, 100% deterministic (zero-AI, offline) **Plain-English & Hybrid SQL Compiler** plus **Damerau-Levenshtein Near-Miss Auto-Correction** across CLI, TUI (`lpr tui`), and Web Studio (`lpr serve`):
+
+1. **Pure Plain-English Queries (Automatically Compiled to SQL)**:
+   ```cmd
+   lpr.exe -f "output\Report.csv" "find unique user agent from todays logs"
+   lpr.exe -f "output\Report.csv" "top 10 url with 500 errors"
+   lpr.exe -f "output\Report.csv" "count by status and server where url contains /cat"
+   lpr.exe -f "output\Report.csv" "slowest 20 requests today"
+   ```
+2. **Hybrid SQL + English Grammar in the Middle of Queries**:
+   ```cmd
+   lpr.exe -f "output\Report.csv" "SELECT * FROM logs where url starts with /cat and status is 302"
+   lpr.exe -f "output\Report.csv" "SELECT * FROM logs where UriStem like '/cat*'"
+   ```
+   *(Automatically maps `url` $\rightarrow$ `"UriStem"` / `cs_uri_stem`, quotes mixed-case CSV columns, and converts glob `*` $\rightarrow$ SQL `%` in `LIKE '/cat*'`).*
+3. **Live Auto-Type (`Tab` / `→` Right Arrow) & *"Did You Mean ...? [Press Y or Enter]"* Auto-Continue**:
+   - While typing in `lpr tui` or `lpr serve`, even misspelled or partial column names (`UriStrem`, `userag`, `SELETC`) show live inline completion `[Tab/→ -> UriStem]`.
+   - If you run a query with a typo (e.g., `SELECT * FROM logs where UriStrem like '/cat*'`), `lpr` displays:
+     `💡 Did you mean: SELECT * FROM logs where "UriStem" ILIKE '/cat%'`
+     Press **`Y`** or **`Enter`** in TUI, CLI, or Web Studio to immediately execute the auto-corrected query!
 
 ---
 

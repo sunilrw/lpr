@@ -1,7 +1,11 @@
 use crate::sym::*;
 use crate::engine::{
-    extract_source_from_sql, format_helpful_error, generate_intent_suggestions, IntentSuggestion,
-    LogEngine,
+    extract_source_from_sql, format_helpful_error_with_sql, generate_intent_suggestions,
+    IntentSuggestion, LogEngine,
+};
+use crate::nl2sql::{
+    find_closest_column, find_closest_sql_keyword, suggest_sql_autocorrect,
+    translate_natural_or_hybrid_sql, AutoCorrectSuggestion,
 };
 use crate::parsers::{clean_windows_path, is_supported_log_or_data_file, InputFormat};
 use crate::server::discover_initial_source;
@@ -84,7 +88,12 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                 suggestions = generate_intent_suggestions(detected_fmt, &columns);
             }
             Err(e) => {
-                last_error = Some(format_helpful_error(&e.to_string(), Some(&active_source), &[]));
+                last_error = Some(format_helpful_error_with_sql(
+                    &e.to_string(),
+                    Some(&active_source),
+                    &[],
+                    None,
+                ));
             }
         }
     }
@@ -114,18 +123,20 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                 last_error = None;
             }
             Err(e) => {
-                last_error = Some(format_helpful_error(
+                last_error = Some(format_helpful_error_with_sql(
                     &e.to_string(),
                     Some(&active_source),
                     &columns,
+                    Some(&sql_input),
                 ));
             }
         }
     } else if last_error.is_none() {
-        last_error = Some(format_helpful_error(
+        last_error = Some(format_helpful_error_with_sql(
             "table 'datafusion.public.logs' not found",
             Some(&active_source),
             &[],
+            None,
         ));
     }
 
@@ -150,16 +161,18 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
     let mut browser_idx: usize = 0;
     let mut tab_cycle_idx: usize = 0;
     let mut last_tab_prefix = String::new();
+    let mut pending_autocorrect: Option<AutoCorrectSuggestion> = None;
 
     loop {
         let hint_token = compute_inline_completion(&sql_input, &columns);
+        let live_translation = translate_natural_or_hybrid_sql(&sql_input, &columns);
 
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(2),
-                    Constraint::Length(4),
+                    Constraint::Length(5),
                     Constraint::Min(8),
                     Constraint::Length(3),
                 ])
@@ -188,17 +201,46 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
             )];
             if let Some(ref suggestion) = hint_token {
                 query_spans.push(Span::styled(
-                    format!("  [Tab -> {}]", suggestion),
+                    format!("  [Tab/→ -> {}]", suggestion),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
 
-            let query_box = Paragraph::new(Line::from(query_spans))
+            let mut editor_lines = vec![Line::from(query_spans)];
+            if let Some(ref sug) = pending_autocorrect {
+                editor_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {SYM_TIP} Did you mean: "),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        sug.corrected_sql.as_str(),
+                        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "   --> Press [Y] or [Enter] to run auto-corrected query!",
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            } else if live_translation.was_english_translated && live_translation.sql != sql_input.trim() {
+                editor_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {SYM_SPARK} Auto-SQL Preview: "),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        live_translation.sql.as_str(),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]));
+            }
+
+            let query_box = Paragraph::new(editor_lines)
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" SQL Editor (Enter=Run | Tab=AutoComplete | F1=Help | F2=Smart Intents | F3=Browse Files | Esc=Quit) "),
+                        .title(" SQL / Plain-English Editor (Enter=Run | Tab/→=AutoType | Y=Accept Did-You-Mean | F1=Help | F2=Intents | F3=Browse | Esc=Quit) "),
                 );
             f.render_widget(query_box, chunks[1]);
 
@@ -211,7 +253,9 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                     Line::from(""),
                 ];
                 for line in err_detail.lines() {
-                    let st = if line.starts_with("WHAT IS WRONG:")
+                    let st = if line.contains("DID YOU MEAN") || line.contains("Press [Y] or [Enter]") {
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+                    } else if line.starts_with("WHAT IS WRONG:")
                         || line.starts_with("HOW TO SOLVE IT:")
                         || line.starts_with("AVAILABLE COLUMNS")
                     {
@@ -229,7 +273,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         Block::default()
                             .borders(Borders::ALL)
                             .style(Style::default().fg(Color::LightRed))
-                            .title(" Diagnostic Details & Solution Steps (Press F3 to Browse Files or F1 for Help) "),
+                            .title(" Diagnostic Details & Auto-Correct (Press Y or Enter to accept Did-You-Mean | F3 to Browse | F1 for Help) "),
                     );
                 f.render_widget(err_box, chunks[2]);
             } else {
@@ -280,14 +324,23 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         )),
                         Line::from(""),
-                        Line::from(Span::styled("1. TUI KEYBOARD SHORTCUTS:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                        Line::from("  • Enter         Execute current SQL query"),
-                        Line::from("  • Tab           Context-aware auto-completion (schema columns, SQL keywords, UDFs)"),
+                        Line::from(Span::styled("1. TUI KEYBOARD SHORTCUTS & AUTO-CORRECT:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Enter         Execute current SQL or Plain-English query (or accept 'Did you mean' fix)"),
+                        Line::from("  • Tab / →       Context-aware & fuzzy auto-type (completes columns, SQL keywords, and near-misses)"),
+                        Line::from("  • Y             Accept 'Did you mean ...?' auto-corrected query and run immediately"),
                         Line::from("  • F1            Toggle this Full Help & Parameter Reference Manual"),
                         Line::from("  • F2            Open Context-Aware Intent Query Picker (tailored to active file)"),
-                        Line::from("  • F3            Open Interactive File & Directory Browser (select file, *.log, or *.csv)"),
+                        Line::from("  • F3 / Ctrl+O   Open Interactive File & Directory Browser (select file, *.log, or *.csv)"),
                         Line::from("  • Ctrl+U        Clear SQL query input"),
                         Line::from("  • Esc           Close active modal or exit TUI"),
+                        Line::from(""),
+                        Line::from(Span::styled("2. PLAIN-ENGLISH & HYBRID SQL GRAMMAR (ZERO AI — DETERMINISTIC COMPILER):", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Pure English:   find unique user agent from todays logs"),
+                        Line::from("  • Pure English:   top 10 url with 500 errors"),
+                        Line::from("  • Pure English:   count by status and server where url contains /cat"),
+                        Line::from("  • Pure English:   slowest 20 requests today"),
+                        Line::from("  • Hybrid SQL:     SELECT * FROM logs where url starts with /cat and status is 302"),
+                        Line::from("  • Glob Wildcard:  SELECT * FROM logs where UriStem like '/cat*'  (auto-converts * -> %)"),
                         Line::from(""),
                         Line::from(Span::styled("2. MULTI-SERVER FLEET SCANNER & TIME WINDOWS (`lpr fleet`):", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
                         Line::from("  • Save server profile once:  lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path \"D:\\Logs\\AcmeStore\" -j 8"),
@@ -454,10 +507,11 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                         );
                                     }
                                     Err(e) => {
-                                        let helpful = format_helpful_error(
+                                        let helpful = format_helpful_error_with_sql(
                                             &e.to_string(),
                                             Some(&active_source),
                                             &columns,
+                                            Some(&sql_input),
                                         );
                                         status_msg = format!("SQL Error: {}", helpful.lines().next().unwrap_or(""));
                                         last_error = Some(helpful);
@@ -513,13 +567,15 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                                     last_error = None;
                                                 }
                                                 Err(e) => {
-                                                    last_error = Some(format_helpful_error(
+                                                    last_error = Some(format_helpful_error_with_sql(
                                                         &e.to_string(),
                                                         Some(&active_source),
                                                         &columns,
+                                                        Some(&sql_input),
                                                     ));
                                                 }
                                             }
+                                            pending_autocorrect = None;
                                             status_msg = format!(
                                                 "Loaded `{}` ({:?}) | {} rows",
                                                 active_source,
@@ -529,10 +585,11 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                             modal = TuiModal::None;
                                         }
                                         Err(e) => {
-                                            let helpful = format_helpful_error(
+                                            let helpful = format_helpful_error_with_sql(
                                                 &e.to_string(),
                                                 Some(&new_source),
                                                 &[],
+                                                None,
                                             );
                                             status_msg = format!(
                                                 "Failed to load file: {}",
@@ -568,7 +625,8 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                             browser_idx = 0;
                             modal = TuiModal::FileBrowser;
                         }
-                        KeyCode::Tab => {
+                        KeyCode::Tab | KeyCode::Right => {
+                            pending_autocorrect = None;
                             apply_tab_autocomplete(
                                 &mut sql_input,
                                 &columns,
@@ -576,7 +634,68 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                 &mut tab_cycle_idx,
                             );
                         }
+                        KeyCode::Char('y') | KeyCode::Char('Y') if pending_autocorrect.is_some() => {
+                            if let Some(sug) = pending_autocorrect.take() {
+                                sql_input = sug.corrected_sql.clone();
+                                last_tab_prefix.clear();
+                                match engine.query(&sql_input).await {
+                                    Ok(batches) => {
+                                        extract_grid(&batches, &mut headers, &mut table_rows);
+                                        last_error = None;
+                                        status_msg = format!(
+                                            "{SYM_SPARK} Auto-Corrected ({}) -> {} rows!",
+                                            sug.changes.join(", "),
+                                            table_rows.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let helpful = format_helpful_error_with_sql(
+                                            &e.to_string(),
+                                            Some(&active_source),
+                                            &columns,
+                                            Some(&sql_input),
+                                        );
+                                        status_msg = format!(
+                                            "SQL Error: {}",
+                                            helpful.lines().next().unwrap_or("")
+                                        );
+                                        last_error = Some(helpful);
+                                    }
+                                }
+                            }
+                        }
                         KeyCode::Enter => {
+                            // If a "Did you mean ...?" suggestion is waiting, pressing Enter immediately runs the auto-corrected query!
+                            if let Some(sug) = pending_autocorrect.take() {
+                                sql_input = sug.corrected_sql.clone();
+                                last_tab_prefix.clear();
+                                match engine.query(&sql_input).await {
+                                    Ok(batches) => {
+                                        extract_grid(&batches, &mut headers, &mut table_rows);
+                                        last_error = None;
+                                        status_msg = format!(
+                                            "{SYM_SPARK} Auto-Corrected ({}) -> {} rows!",
+                                            sug.changes.join(", "),
+                                            table_rows.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let helpful = format_helpful_error_with_sql(
+                                            &e.to_string(),
+                                            Some(&active_source),
+                                            &columns,
+                                            Some(&sql_input),
+                                        );
+                                        status_msg = format!(
+                                            "SQL Error: {}",
+                                            helpful.lines().next().unwrap_or("")
+                                        );
+                                        last_error = Some(helpful);
+                                    }
+                                }
+                                continue;
+                            }
+
                             let (rewritten_sql, extracted_path) = extract_source_from_sql(&sql_input);
                             if let Some(raw_new_path) = extracted_path {
                                 let new_path = clean_windows_path(&raw_new_path);
@@ -595,10 +714,11 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                                 generate_intent_suggestions(detected_fmt, &columns);
                                         }
                                         Err(e) => {
-                                            let helpful = format_helpful_error(
+                                            let helpful = format_helpful_error_with_sql(
                                                 &e.to_string(),
                                                 Some(&new_path),
                                                 &columns,
+                                                Some(&sql_input),
                                             );
                                             status_msg = format!(
                                                 "Source Error: {}",
@@ -610,30 +730,51 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                     }
                                 }
                             }
+                            let nl_res = translate_natural_or_hybrid_sql(&rewritten_sql, &columns);
                             match engine.query(&rewritten_sql).await {
                                 Ok(batches) => {
                                     extract_grid(&batches, &mut headers, &mut table_rows);
                                     last_error = None;
-                                    status_msg = format!(
-                                        "Returned {} rows | F1=Help | F2=Intents | F3=Browse Files",
-                                        table_rows.len()
-                                    );
+                                    pending_autocorrect = None;
+                                    if nl_res.was_english_translated && nl_res.sql != rewritten_sql.trim() {
+                                        status_msg = format!(
+                                            "{SYM_SPARK} {} -> `{}` ({} rows)",
+                                            nl_res.note.unwrap_or_else(|| "Translated".to_string()),
+                                            nl_res.sql,
+                                            table_rows.len()
+                                        );
+                                    } else {
+                                        status_msg = format!(
+                                            "Returned {} rows | F1=Help | F2=Intents | F3=Browse Files",
+                                            table_rows.len()
+                                        );
+                                    }
                                 }
                                 Err(e) => {
-                                    let helpful = format_helpful_error(
+                                    pending_autocorrect = suggest_sql_autocorrect(&rewritten_sql, &columns);
+                                    let helpful = format_helpful_error_with_sql(
                                         &e.to_string(),
                                         Some(&active_source),
                                         &columns,
+                                        Some(&rewritten_sql),
                                     );
-                                    status_msg = format!(
-                                        "SQL Error: {}",
-                                        helpful.lines().next().unwrap_or("")
-                                    );
+                                    if let Some(ref sug) = pending_autocorrect {
+                                        status_msg = format!(
+                                            "{SYM_TIP} Did you mean: {}  --> Press [Y] or [Enter] to run!",
+                                            sug.corrected_sql
+                                        );
+                                    } else {
+                                        status_msg = format!(
+                                            "SQL Error: {}",
+                                            helpful.lines().next().unwrap_or("")
+                                        );
+                                    }
                                     last_error = Some(helpful);
                                 }
                             }
                         }
                         KeyCode::Backspace => {
+                            pending_autocorrect = None;
                             sql_input.pop();
                             last_tab_prefix.clear();
                         }
@@ -642,10 +783,12 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
+                            pending_autocorrect = None;
                             sql_input.clear();
                             last_tab_prefix.clear();
                         }
                         KeyCode::Char(c) => {
+                            pending_autocorrect = None;
                             sql_input.push(c);
                             last_tab_prefix.clear();
                         }
@@ -671,14 +814,37 @@ fn compute_inline_completion(sql: &str, columns: &[String]) -> Option<String> {
         return None;
     }
     let lower = word.to_lowercase();
+    // 1. Exact prefix match on schema columns
     for col in columns {
-        if col.to_lowercase().starts_with(&lower) && col.len() > word.len() {
+        if col.to_lowercase().starts_with(&lower) && !col.eq_ignore_ascii_case(word) {
             return Some(col.clone());
         }
     }
+    // 2. Exact prefix match on SQL keywords / UDFs
     for &kw in STATIC_COMPLETIONS {
-        if kw.to_lowercase().starts_with(&lower) && kw.len() > word.len() {
+        if kw.to_lowercase().starts_with(&lower) && !kw.eq_ignore_ascii_case(word) {
             return Some(kw.to_string());
+        }
+    }
+    // 3. Substring match on schema columns (e.g., typing `stem` suggests `UriStem` / `cs_uri_stem`)
+    if word.len() >= 2 {
+        for col in columns {
+            if col.to_lowercase().contains(&lower) && !col.eq_ignore_ascii_case(word) {
+                return Some(col.clone());
+            }
+        }
+    }
+    // 4. Fuzzy near-miss auto-correct match on schema columns or SQL keywords (e.g., `UriStrem` -> `UriStem`)
+    if word.len() >= 3 {
+        if let Some((closest_col, _)) = find_closest_column(word, columns) {
+            if !closest_col.eq_ignore_ascii_case(word) {
+                return Some(closest_col);
+            }
+        }
+        if let Some((closest_kw, _)) = find_closest_sql_keyword(word) {
+            if !closest_kw.eq_ignore_ascii_case(word) {
+                return Some(closest_kw.to_string());
+            }
         }
     }
     None
@@ -715,6 +881,21 @@ fn apply_tab_autocomplete(
     for &kw in STATIC_COMPLETIONS {
         if lower.is_empty() || kw.to_lowercase().starts_with(&lower) {
             matches.push(kw.to_string());
+        }
+    }
+    if matches.is_empty() && lower.len() >= 2 {
+        for col in columns {
+            if col.to_lowercase().contains(&lower) {
+                matches.push(col.clone());
+            }
+        }
+    }
+    if matches.is_empty() && lower.len() >= 3 {
+        if let Some((closest_col, _)) = find_closest_column(&prefix, columns) {
+            matches.push(closest_col);
+        }
+        if let Some((closest_kw, _)) = find_closest_sql_keyword(&prefix) {
+            matches.push(closest_kw.to_string());
         }
     }
 

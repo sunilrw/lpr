@@ -5,6 +5,7 @@ mod fleet;
 mod gui;
 mod hooks;
 mod mcp;
+mod nl2sql;
 mod parsers;
 mod server;
 mod sinks;
@@ -48,10 +49,11 @@ pub fn get_ascii_banner() -> String {
     about = "Modern Multi-Threaded Rust SQL Log Parser, Fleet Scanner, Journey Tracer & Security Auditor",
     long_about = "High-performance vectorized & multi-threaded log engine powered by Apache Arrow, DataFusion & Rayon.\nReads uncompressed logs, CSVs, .zip archives, .gz, and .zst streams directly across CPU cores.\nSupports ANSI SQL, Microsoft Log Parser 2.2 syntax (`-i:IISW3C`, `SELECT TOP 10 ... INTO out.csv FROM *.log`), multi-server fleet scanning (`lpr fleet`), deterministic session intelligence & cross-server user journey reconstruction (`--learn`, `--trace`, `--customer`, `--trace-ip`), Linux CLI filters (`-g`, `-v`, `-F`, `--stats`), .NET/PowerShell integration (`lpr sdk`), HTTP Web Studio (`lpr serve`), Terminal UI (`lpr tui`), and AI MCP (`lpr mcp`).",
     after_help = r#"COMPLETE EXAMPLES & COMMON WORKFLOWS:
-  1. Single-File / Wildcard / Archive SQL Query (Log Parser 2.2 & ANSI SQL):
+  1. Single-File / Wildcard / Archive SQL & Plain-English Query (Log Parser 2.2, ANSI SQL & Natural English):
      lpr -f "D:\Logs\W3SVC1\*.log" "SELECT TOP 25 date, time, c_ip, cs_uri_stem, sc_status, time_taken FROM logs WHERE sc_status LIKE '5%'"
+     lpr -f "output\Report.csv" "find unique user agent from todays logs"
+     lpr -f "output\Report.csv" "SELECT * FROM logs where url starts with /cat and status is 302"
      lpr -i:IISW3C "SELECT cs-uri-stem, sc-status, COUNT(*) AS hits INTO summary.csv FROM 'D:\Logs\*.log' GROUP BY 1, 2 ORDER BY hits DESC"
-     lpr -f "output\Report.csv" "SELECT * FROM logs LIMIT 50"
 
   2. Multi-Server Fleet Scanner & Time Windows (`lpr fleet --help` for all fleet flags):
      lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path "D:\Logs\AcmeStore" -j 8
@@ -688,12 +690,20 @@ pub fn print_full_manual() {
 {SYM_BOOKS} LPR v{} COMPLETE REFERENCE MANUAL (FLEET + JOURNEY TRACER + SQL + LOG PARSER 2.2 + LINUX + TUI/WEB)
 ================================================================================
 
-1. DIRECT .LOG, .CSV, .ZIP, .GZ, AND .ZST ARCHIVE & MULTI-THREADED QUERYING
+1. DIRECT .LOG, .CSV, .ZIP, .GZ, AND .ZST ARCHIVE & PLAIN-ENGLISH / SQL QUERYING
 --------------------------------------------------------------------------------
   • Query a single file, wildcard glob, CSV report, or .zip archive in parallel across CPU threads:
     lpr -f "D:\Logs\W3SVC1\*.log" "SELECT sc_status, COUNT(*) AS hits FROM logs GROUP BY 1 ORDER BY hits DESC"
     lpr -f "output\Report.csv" "SELECT * FROM logs LIMIT 50"
     lpr -j 8 -V -f "logs_archive.zip" "SELECT * FROM logs WHERE sc-status LIKE '5%' INTO 500_errors.csv"
+  • Plain-English & Hybrid Grammar-to-SQL Compiler (Deterministic, Zero AI):
+    lpr -f "output\Report.csv" "find unique user agent from todays logs"
+    lpr -f "output\Report.csv" "top 10 url with 500 errors"
+    lpr -f "output\Report.csv" "count by status and server where url contains /cat"
+    lpr -f "output\Report.csv" "SELECT * FROM logs where url starts with /cat and status is 302"
+  • Near-Miss Auto-Correct ("Did you mean ...?"):
+    Automatically detects misspelled columns/keywords (e.g. `UriStrem` -> `"UriStem"`, `LIKE '/cat*'` -> `LIKE '/cat%'`)
+    and lets you press [Y] or [Enter] to continue with the auto-corrected query immediately!
 
 2. MULTI-SERVER FLEET SCANNER & SAVED PROFILES (`lpr fleet` & `lpr config`)
 --------------------------------------------------------------------------------
@@ -1554,8 +1564,49 @@ async fn run_cli() -> Result<()> {
         rewritten_sql
     };
 
-    let sql_start = std::time::Instant::now();
-    let batches = engine.query(&final_sql).await?;
+    let nl_res = nl2sql::translate_natural_or_hybrid_sql(&final_sql, &known_cols);
+    if nl_res.was_english_translated && nl_res.sql != final_sql.trim() && (show_status || log_file_writer.is_some()) {
+        log_message(
+            &mut log_file_writer,
+            show_status,
+            &format!(" {SYM_SPARK} Auto-Compiled   : {}", nl_res.sql),
+        );
+    }
+
+    let mut sql_start = std::time::Instant::now();
+    let batches = match engine.query(&final_sql).await {
+        Ok(b) => b,
+        Err(e) => {
+            if let Some(sug) = nl2sql::suggest_sql_autocorrect(&final_sql, &known_cols) {
+                if std::io::stdin().is_terminal() && !cli.quiet && !cli.no_log {
+                    eprintln!("================================================================================");
+                    eprintln!(" {SYM_TIP} DID YOU MEAN THIS AUTO-CORRECTED QUERY?");
+                    eprintln!("   {}", sug.corrected_sql);
+                    eprintln!("   (Fixes: {})", sug.changes.join(", "));
+                    eprintln!("================================================================================");
+                    eprint!(" {SYM_SPARK} Press [Y] or [Enter] to run auto-corrected query (or [N] to cancel): ");
+                    let _ = std::io::stderr().flush();
+                    let mut reply = String::new();
+                    if std::io::stdin().read_line(&mut reply).is_ok() {
+                        let r = reply.trim();
+                        if r.is_empty() || r.eq_ignore_ascii_case("y") || r.eq_ignore_ascii_case("yes") {
+                            eprintln!(" {SYM_OK} Continuing with auto-corrected query: `{}`", sug.corrected_sql);
+                            sql_start = std::time::Instant::now();
+                            engine.query(&sug.corrected_sql).await?
+                        } else {
+                            return Err(e);
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
     let sql_elapsed = sql_start.elapsed();
     let matched_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 

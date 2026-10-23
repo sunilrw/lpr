@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>lpr Studio v1.4.4 — Modern SQL Log Parser, Fleet Scanner &amp; Security Auditor</title>
+  <title>lpr Studio v1.4.5 — Modern SQL Log Parser, Fleet Scanner &amp; Security Auditor</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -38,7 +38,7 @@
       <div>
         <div class="flex items-center gap-2">
           <span class="text-base font-bold tracking-tight text-white">lpr Studio</span>
-          <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.4.4</span>
+          <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.4.5</span>
           <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
             <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span> DataFusion 42
           </span>
@@ -181,10 +181,10 @@
           <div class="flex items-center gap-3">
             <span class="mono font-semibold text-indigo-400 flex items-center gap-1.5">
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>
-              SQL Query Editor (ANSI SQL &amp; Log Parser 2.2 Syntax)
+              SQL &amp; Plain-English Query Editor (ANSI SQL, Log Parser 2.2 &amp; Natural English)
             </span>
             <span class="hidden sm:inline-block text-[11px] px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400">
-              💡 Type or press <kbd class="text-indigo-300">Tab</kbd> / <kbd class="text-indigo-300">Ctrl+Space</kbd> for Context Auto-Complete
+              💡 Type SQL or English (e.g. <code>find unique user agent from todays logs</code>) • <kbd class="text-indigo-300">Tab</kbd> / <kbd class="text-indigo-300">→</kbd> Auto-Type
             </span>
           </div>
           <div class="flex items-center gap-3">
@@ -195,6 +195,17 @@
         <textarea id="sql" rows="4" spellcheck="false"
           oninput="onSqlInput(event)" onkeydown="onSqlKeydown(event)"
           class="w-full p-4 bg-slate-950 text-emerald-300 mono text-sm focus:outline-none resize-y leading-relaxed font-mono rounded-b-2xl">SELECT date, time, c_ip, cs_method, cs_uri_stem, sc_status, sc_substatus, time_taken FROM logs WHERE sc_status LIKE '5%'</textarea>
+
+        <!-- Plain-English / Hybrid Translation Banner -->
+        <div id="nl-translation-banner" class="hidden px-4 py-2 bg-indigo-950/50 border-t border-indigo-500/30 rounded-b-2xl flex items-center justify-between gap-3 text-xs mono">
+          <div class="truncate text-indigo-200">
+            <span class="font-bold text-cyan-300">✨ Auto-Compiled SQL:</span>
+            <span id="nl-translated-sql" class="text-emerald-300 ml-1"></span>
+          </div>
+          <button onclick="applyTranslatedSqlToEditor()" class="px-2.5 py-1 rounded bg-indigo-600/40 hover:bg-indigo-600 text-white text-[11px] shrink-0 transition">
+            Replace in Editor
+          </button>
+        </div>
 
         <!-- Floating Context-Aware Auto-Complete Dropdown -->
         <div id="ac-popup" class="hidden absolute left-4 bottom-2 translate-y-full z-40 w-96 max-h-64 overflow-y-auto rounded-xl bg-slate-900 border border-indigo-500/60 shadow-2xl divide-y divide-slate-800/80 text-xs mono">
@@ -264,7 +275,7 @@
     <!-- TAB 3: Full Help & Reference Manual -->
     <div id="tab-docs" class="hidden space-y-6">
       <div class="p-5 rounded-2xl bg-gradient-to-r from-indigo-950/40 via-slate-900 to-slate-900 border border-indigo-500/20">
-        <h2 class="text-lg font-bold text-white">📚 lpr v1.4.4 Complete Help Manual, Fleet Scanner, Journey Tracer &amp; SQL Reference</h2>
+        <h2 class="text-lg font-bold text-white">📚 lpr v1.4.5 Complete Help Manual, Plain-English SQL, Fleet Scanner &amp; Journey Tracer</h2>
         <p class="text-xs text-slate-300 mt-1">Click any example SQL query below to load it directly into the SQL editor, or copy the CLI commands for multi-server operations.</p>
       </div>
 
@@ -464,7 +475,7 @@
   </div>
 
   <footer class="border-t border-slate-800/60 py-4 px-6 text-center text-xs text-slate-500">
-    <span>lpr Studio v1.4.4 • Modern SQL Log Parser, Fleet Scanner &amp; Security Auditor • Built in Rust with Apache Arrow &amp; DataFusion • Made using vibe coding by Sunil Warrier</span>
+    <span>lpr Studio v1.4.5 • Modern SQL Log Parser, Plain-English Query Compiler, Fleet Scanner &amp; Security Auditor • Built in Rust with Apache Arrow &amp; DataFusion • Made using vibe coding by Sunil Warrier</span>
   </footer>
 
   <script>
@@ -474,15 +485,22 @@
     let parentDirPath = null;
     let currentFolderGlob = '*.log';
     let currentFolderCsvGlob = '*.csv';
+    let pendingSuggestedSql = null;
+    let lastTranslatedSql = null;
 
     const SQL_KEYWORDS_AND_UDFS = [
+      { token: 'find unique user agent from todays logs', kind: 'ENGLISH', desc: 'Plain-English: Unique User-Agents today' },
+      { token: 'top 10 url with 500 errors', kind: 'ENGLISH', desc: 'Plain-English: Top 10 URLs returning 500 errors' },
+      { token: 'count by status and server', kind: 'ENGLISH', desc: 'Plain-English: Breakdown by status & server' },
+      { token: 'slowest 20 requests today', kind: 'ENGLISH', desc: 'Plain-English: Slowest 20 requests by latency' },
+      { token: 'where url starts with /cat', kind: 'ENGLISH', desc: 'Hybrid English WHERE clause' },
       { token: 'SELECT ', kind: 'SQL', desc: 'Select columns or expressions' },
       { token: 'FROM logs', kind: 'SQL', desc: 'Default registered log table' },
       { token: 'WHERE ', kind: 'SQL', desc: 'Filter rows by condition' },
       { token: 'GROUP BY ', kind: 'SQL', desc: 'Aggregate rows by columns' },
       { token: 'ORDER BY ', kind: 'SQL', desc: 'Sort result rows' },
       { token: 'LIMIT 50', kind: 'SQL', desc: 'Limit returned row count' },
-      { token: 'LIKE ', kind: 'SQL', desc: 'Wildcard pattern match (% or _)' },
+      { token: 'LIKE ', kind: 'SQL', desc: 'Wildcard pattern match (% or *)' },
       { token: 'COUNT(*)', kind: 'AGG', desc: 'Count matching rows' },
       { token: 'detect_threat(', kind: 'UDF', desc: 'Detect SQLi, XSS, LFI, RCE, Log4Shell' },
       { token: 'ip_in_cidr(', kind: 'UDF', desc: 'Check IPv4/IPv6 CIDR subnet inclusion' },
@@ -637,21 +655,69 @@
       return match ? { word: match[0], start: caretPos - match[0].length, end: caretPos } : { word: '', start: caretPos, end: caretPos };
     }
 
+    function damerauLevenshtein(a, b) {
+      const m = a.length, n = b.length;
+      if (!m) return n;
+      if (!n) return m;
+      const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+      for (let i = 0; i <= m; i++) dp[i][0] = i;
+      for (let j = 0; j <= n; j++) dp[0][j] = j;
+      for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+          if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+            dp[i][j] = Math.min(dp[i][j], dp[i - 2][j - 2] + 1);
+          }
+        }
+      }
+      return dp[m][n];
+    }
+
     function buildAutocompleteCandidates(prefix) {
       const p = prefix.toLowerCase();
       const candidates = [];
+      const seen = new Set();
 
+      // 1. Prefix or substring match on schema columns
       activeColumns.forEach(col => {
         if (!p || col.toLowerCase().includes(p)) {
-          candidates.push({ token: col, kind: 'COLUMN', desc: 'Log table column' });
+          candidates.push({ token: col, kind: 'COLUMN', desc: 'Schema column' });
+          seen.add(col.toLowerCase());
         }
       });
 
+      // 2. Prefix or substring match on SQL keywords / UDFs / English templates
       SQL_KEYWORDS_AND_UDFS.forEach(item => {
         if (!p || item.token.toLowerCase().includes(p)) {
           candidates.push(item);
+          seen.add(item.token.toLowerCase().trim());
         }
       });
+
+      // 3. Fuzzy near-miss auto-correct (e.g. UriStrem -> UriStem, SELETC -> SELECT)
+      if (p.length >= 3) {
+        const cleanP = p.replace(/[_-]/g, '');
+        activeColumns.forEach(col => {
+          if (!seen.has(col.toLowerCase())) {
+            const cleanC = col.toLowerCase().replace(/[_-]/g, '');
+            const dist = damerauLevenshtein(cleanP, cleanC);
+            if (dist <= 2) {
+              candidates.unshift({ token: col, kind: 'AUTO-FIX', desc: `Did you mean column '${col}'?` });
+              seen.add(col.toLowerCase());
+            }
+          }
+        });
+        SQL_KEYWORDS_AND_UDFS.forEach(item => {
+          const kw = item.token.trim().toLowerCase();
+          if (item.kind === 'SQL' && !seen.has(kw)) {
+            if (damerauLevenshtein(p, kw) <= 2) {
+              candidates.unshift({ token: item.token, kind: 'AUTO-FIX', desc: `Did you mean '${item.token.trim()}'?` });
+              seen.add(kw);
+            }
+          }
+        });
+      }
 
       return candidates.slice(0, 10);
     }
@@ -739,7 +805,7 @@
           acSelectedIndex = (acSelectedIndex - 1 + acMatches.length) % acMatches.length;
           renderAutocompletePopup();
           return;
-        } else if (e.key === 'Tab') {
+        } else if (e.key === 'Tab' || (e.key === 'ArrowRight' && e.target.selectionStart === e.target.value.length)) {
           e.preventDefault();
           acceptAutocomplete(acSelectedIndex);
           return;
@@ -850,8 +916,18 @@
         const payload = await res.json();
 
         if (!res.ok || payload.error) {
-          renderError(payload.error || 'Unknown query execution error');
+          document.getElementById('nl-translation-banner').classList.add('hidden');
+          renderError(payload.error || 'Unknown query execution error', payload.suggested_sql, payload.corrections);
           return;
+        }
+
+        pendingSuggestedSql = null;
+        if (payload.translated_sql) {
+          lastTranslatedSql = payload.translated_sql;
+          document.getElementById('nl-translated-sql').innerText = payload.translated_sql;
+          document.getElementById('nl-translation-banner').classList.remove('hidden');
+        } else {
+          document.getElementById('nl-translation-banner').classList.add('hidden');
         }
 
         if (payload.columns && payload.columns.length > 0) {
@@ -953,9 +1029,39 @@
       document.getElementById('stat-rows').innerText = `${filtered.length} / ${currentRawData.length} filtered`;
     }
 
-    function renderError(msg) {
+    function applyTranslatedSqlToEditor() {
+      if (lastTranslatedSql) {
+        document.getElementById('sql').value = lastTranslatedSql;
+      }
+    }
+
+    function acceptSuggestedQuery() {
+      if (!pendingSuggestedSql) return;
+      document.getElementById('sql').value = pendingSuggestedSql;
+      pendingSuggestedSql = null;
+      runQuery();
+    }
+
+    function renderError(msg, suggestedSql, corrections) {
+      pendingSuggestedSql = suggestedSql || null;
       const t = document.getElementById('result-table');
+      const corrBadge = (corrections && corrections.length)
+        ? `<div class="text-xs text-emerald-300 mt-1">Fixes: ${escapeHtml(corrections.join(', '))}</div>`
+        : '';
+      const didYouMeanHtml = suggestedSql ? `
+        <div class="mb-4 p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/50 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div class="text-emerald-300 font-bold text-xs uppercase tracking-wider">💡 Did you mean this auto-corrected query?</div>
+            <div class="text-white font-bold mono text-sm mt-1">${escapeHtml(suggestedSql)}</div>
+            ${corrBadge}
+          </div>
+          <button onclick="acceptSuggestedQuery()" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/30 transition">
+            ✨ Yes, Run Auto-Corrected Query (or Press Y)
+          </button>
+        </div>` : '';
+
       t.innerHTML = `<tbody><tr><td class="p-6 text-left text-rose-400 bg-rose-950/20 border-t border-rose-900/40 mono text-xs">
+        ${didYouMeanHtml}
         <div class="font-bold text-sm mb-2">⚠️ Query Execution Failed</div>
         <pre class="text-slate-200 whitespace-pre-wrap leading-relaxed font-mono text-xs">${escapeHtml(msg)}</pre>
       </td></tr></tbody>`;
@@ -1078,6 +1184,9 @@
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
         runQuery();
+      } else if (pendingSuggestedSql && document.activeElement !== document.getElementById('sql') && (e.key === 'y' || e.key === 'Y' || e.key === 'Enter')) {
+        e.preventDefault();
+        acceptSuggestedQuery();
       } else if (e.key === 'Escape') {
         closeFileBrowser();
         hideAutocomplete();

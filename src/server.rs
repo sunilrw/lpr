@@ -1,6 +1,7 @@
 use crate::sym::*;
 use crate::audit::evaluate_security_findings;
-use crate::engine::{extract_source_from_sql, format_helpful_error, LogEngine};
+use crate::engine::{extract_source_from_sql, format_helpful_error, format_helpful_error_with_sql, LogEngine};
+use crate::nl2sql::{suggest_sql_autocorrect, translate_natural_or_hybrid_sql};
 use crate::parsers::{clean_windows_path, is_supported_log_or_data_file, InputFormat};
 use crate::sinks::batches_to_json_value;
 use axum::{
@@ -61,6 +62,10 @@ pub struct QueryResponse {
     pub execution_time_ms: u128,
     pub columns: Vec<String>,
     pub data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub translated_sql: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub translation_explanation: Option<String>,
 }
 
 /// Discovers the best default log or CSV file in the current workspace if none was explicitly specified.
@@ -220,6 +225,12 @@ async fn handle_query(State(state): State<Arc<AppState>>, Json(req): Json<QueryR
     }
 
     let columns = engine.table_columns("logs").await;
+    let nl_res = translate_natural_or_hybrid_sql(&rewritten_sql, &columns);
+    let translated_sql = if nl_res.was_english_translated && nl_res.sql != rewritten_sql.trim() {
+        Some(nl_res.sql.clone())
+    } else {
+        None
+    };
 
     match engine.query(&rewritten_sql).await {
         Ok(batches) => {
@@ -234,16 +245,28 @@ async fn handle_query(State(state): State<Arc<AppState>>, Json(req): Json<QueryR
                         execution_time_ms,
                         columns,
                         data,
+                        translated_sql,
+                        translation_explanation: nl_res.note,
                     })
                     .unwrap(),
                 ),
             )
         }
         Err(e) => {
-            let helpful = format_helpful_error(&e.to_string(), src_clean.as_deref(), &columns);
+            let helpful = format_helpful_error_with_sql(
+                &e.to_string(),
+                src_clean.as_deref(),
+                &columns,
+                Some(&rewritten_sql),
+            );
+            let sug = suggest_sql_autocorrect(&rewritten_sql, &columns);
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": helpful })),
+                Json(serde_json::json!({
+                    "error": helpful,
+                    "suggested_sql": sug.as_ref().map(|s| &s.corrected_sql),
+                    "corrections": sug.as_ref().map(|s| &s.changes),
+                })),
             )
         }
     }
