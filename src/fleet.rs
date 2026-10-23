@@ -1,8 +1,8 @@
 use crate::sym::*;
 use crate::engine::LogEngine;
 use crate::parsers::{
-    filter_items_by_datetime, filter_items_by_min_date, keep_latest_log_item,
-    resolve_source_items, resolve_source_items_with_cutoff, InputFormat, ScanPreFilter,
+    extract_sql_pre_filter, filter_items_by_datetime, filter_items_by_min_date,
+    keep_latest_log_item, resolve_source_items_with_cutoff, InputFormat, ScanPreFilter,
 };
 use crate::sinks::batches_to_json_value;
 use anyhow::Result;
@@ -115,6 +115,26 @@ pub struct SavedProfile {
     /// Inline server list saved directly inside the profile
     #[serde(default)]
     pub servers: Vec<ServerEntry>,
+    /// Deterministically learned session/cookie/query/IP intelligence for cross-server journey reconstruction
+    #[serde(default)]
+    pub session_intelligence: Option<SessionIntelligence>,
+}
+
+/// Deterministic, non-AI correlation intelligence learned from scanning a server's W3C/web logs
+/// and stored in `lpr.config.json` for fast cross-server user journey reconstruction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionIntelligence {
+    pub learned_at_utc: String,
+    pub sample_rows_analyzed: usize,
+    pub detected_columns: Vec<String>,
+    /// High-cardinality cookie names that identify a user, session, customer, visitor, or cart across requests
+    pub identity_cookies: Vec<String>,
+    /// Query-string parameter names (`cs-uri-query`) that carry customer, order, payment, cart, or session IDs
+    pub query_correlators: Vec<String>,
+    /// Client IP columns in priority order (e.g. `x_forwarded_for`, `cf_connecting_ip`, `true_client_ip`, `c_ip`)
+    pub client_ip_columns: Vec<String>,
+    /// Response redirect header column if logged by IIS (`sclocation` / `sc_location` / `location`)
+    pub redirect_location_column: Option<String>,
 }
 
 impl Default for SavedProfile {
@@ -150,6 +170,7 @@ impl Default for SavedProfile {
             auth_password_ref: None,
             auth_password_enc: None,
             servers: Vec::new(),
+            session_intelligence: None,
         }
     }
 }
@@ -274,9 +295,15 @@ pub struct FleetScanConfig {
     pub server_numbers: Option<String>,
     pub local_path: Option<String>,
     pub status_prefix: Option<String>,
+    pub contains_pattern: Option<String>,
     pub custom_sql: Option<String>,
     pub hours: Option<i64>,
     pub latest_only: bool,
+    pub learn_intelligence: bool,
+    pub trace_journeys: bool,
+    pub trace_id: Option<String>,
+    pub trace_window_mins: i64,
+    pub max_journeys: usize,
     pub threads: Option<usize>,
     pub verbose: bool,
 }
@@ -322,6 +349,12 @@ pub struct FleetErrorRow {
     pub log_file: String,
     #[serde(rename = "LogRow")]
     pub log_row: String,
+    #[serde(skip_serializing)]
+    pub forwarded_ip: String,
+    #[serde(skip_serializing)]
+    pub cookie: String,
+    #[serde(skip_serializing)]
+    pub redirect_location: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,6 +369,14 @@ pub struct FleetServerSummary {
     pub total_errors: usize,
     #[serde(rename = "LogFilesScanned")]
     pub log_files_scanned: usize,
+    #[serde(rename = "LogFilesTotal")]
+    pub log_files_total: usize,
+    #[serde(rename = "LinesScanned")]
+    pub lines_scanned: usize,
+    #[serde(rename = "BytesScanned")]
+    pub bytes_scanned: u64,
+    #[serde(rename = "ElapsedSeconds")]
+    pub elapsed_seconds: String,
     #[serde(rename = "Engine")]
     pub engine: String,
     #[serde(rename = "FirstError")]
@@ -404,6 +445,17 @@ pub fn print_saved_profiles(cfg_file_path: Option<&str>) {
             println!(
                 "     SMB Auth       : user={:?} domain={:?} secret=[{}]",
                 u, p.auth_domain, secret_mode
+            );
+        }
+        if let Some(ref intel) = p.session_intelligence {
+            println!(
+                "     Session Intel  : Learned={} ({} rows) | Cookies={:?} | QueryKeys={:?} | IPCols={:?} | RedirectCol={:?}",
+                intel.learned_at_utc,
+                intel.sample_rows_analyzed,
+                intel.identity_cookies,
+                intel.query_correlators,
+                intel.client_ip_columns,
+                intel.redirect_location_column
             );
         }
     }
@@ -860,10 +912,14 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 format!("IIS-{}00Errors", profile.status_prefix.as_deref().unwrap_or("5"))
             }
         });
-    let status_prefix = profile
-        .status_prefix
-        .clone()
-        .unwrap_or_else(|| "5".to_string());
+    let status_prefix = if req.trace_id.is_some() && req.status_prefix.is_none() {
+        "*".to_string()
+    } else {
+        profile
+            .status_prefix
+            .clone()
+            .unwrap_or_else(|| "5".to_string())
+    };
     let custom_sql = profile.default_sql.clone();
     let output_dir = profile
         .output_dir
@@ -924,7 +980,75 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     println!(" {SYM_FOLDER} Output Folder: {} | Report Prefix: {}", output_dir, report_prefix);
     println!("================================================================================");
 
-    if let Some(ref local_target) = profile.local_path {
+    let fleet_start = std::time::Instant::now();
+    let trace_id_clean = req
+        .trace_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let trace_active = req.trace_journeys || trace_id_clean.is_some();
+
+    let mut base_pre_filter = if let Some(ref sql_q) = custom_sql {
+        extract_sql_pre_filter(sql_q)
+    } else {
+        ScanPreFilter::default()
+    };
+    base_pre_filter.min_date = Some(cutoff_date.clone());
+    base_pre_filter.min_time = cutoff_time.clone();
+    // When tracing a specific Customer ID / Session / IP without --status, scan all statuses (200, 302, 500, etc.)
+    if trace_id_clean.is_some() && req.status_prefix.is_none() && custom_sql.is_none() {
+        base_pre_filter.status_prefix = None;
+    } else if custom_sql.is_none() || req.status_prefix.is_some() {
+        base_pre_filter.status_prefix = Some(status_prefix.clone());
+    }
+    if let Some(ref pat) = req.contains_pattern {
+        let lower = pat.trim().to_ascii_lowercase();
+        if !lower.is_empty() && !base_pre_filter.required_substrings.contains(&lower) {
+            base_pre_filter.required_substrings.push(lower);
+        }
+    }
+    if let Some(ref tid) = trace_id_clean {
+        let lower = tid.to_ascii_lowercase();
+        if !lower.is_empty() && !base_pre_filter.required_substrings.contains(&lower) {
+            base_pre_filter.required_substrings.push(lower);
+        }
+    }
+
+    if !base_pre_filter.required_substrings.is_empty()
+        || !base_pre_filter.any_substrings.is_empty()
+        || base_pre_filter.status_prefix.is_some()
+    {
+        println!(
+            " {SYM_ZAP} Raw-Byte Pushdown : StatusPrefix={:?} | RequiredSubstrings={:?} | AnySubstrings={:?}",
+            base_pre_filter.status_prefix,
+            base_pre_filter.required_substrings,
+            base_pre_filter.any_substrings
+        );
+    }
+
+    if let Some(ref local_target) = profile.local_path.clone() {
+        if req.learn_intelligence || (trace_active && profile.session_intelligence.is_none()) {
+            let cutoff_naive = chrono::NaiveDate::parse_from_str(&cutoff_date, "%Y-%m-%d")
+                .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+            if let Ok(sample_items) =
+                resolve_source_items_with_cutoff(local_target, Some(cutoff_naive))
+            {
+                let sample_subset: Vec<_> = sample_items.into_iter().take(2).collect();
+                if let Ok(intel) =
+                    learn_session_intelligence_from_items(&sample_subset, threads).await
+                {
+                    print_session_intelligence_summary(&active_profile_name, &intel);
+                    profile.session_intelligence = Some(intel);
+                    cfg_store
+                        .profiles
+                        .insert(active_profile_name.clone(), profile.clone());
+                    let _ = cfg_store.save(req.cfg_file_path.as_deref());
+                }
+            }
+            if req.learn_intelligence && !trace_active {
+                return Ok(());
+            }
+        }
         return run_local_or_archive_fleet_scan(
             local_target,
             &cutoff_date,
@@ -938,6 +1062,13 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             verbose,
             custom_sql.as_deref(),
             latest_only,
+            &base_pre_filter,
+            fleet_start,
+            trace_active,
+            trace_id_clean.as_deref(),
+            req.trace_window_mins,
+            req.max_journeys,
+            profile.session_intelligence.as_ref(),
         )
         .await;
     }
@@ -986,6 +1117,13 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     let mut failed_servers: Vec<String> = Vec::new();
     let mut custom_cols: Vec<String> = Vec::new();
     let mut custom_rows: Vec<Vec<String>> = Vec::new();
+    let mut resolved_server_sources: Vec<(
+        ServerEntry,
+        Vec<crate::parsers::LogSourceItem>,
+        String,
+        InputFormat,
+    )> = Vec::new();
+    let mut learned_during_scan = false;
 
     #[cfg(windows)]
     let resolved_smb_secret = if profile.auth_user.is_some() {
@@ -995,6 +1133,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
     };
 
     for srv in &servers {
+        let srv_start = std::time::Instant::now();
         // SSH Transport Mode for Linux / Unix Web Servers (Nginx, Apache, Caddy, HAProxy, Tomcat)
         if ssh_enabled {
             match scan_linux_server_via_ssh(
@@ -1014,6 +1153,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             .await
             {
                 Ok((rows, generic, files_count, scanned_info)) => {
+                    let srv_secs = srv_start.elapsed().as_secs_f64();
                     let first_err = rows
                         .first()
                         .map(|r| format!("{} {}", r.date, r.time))
@@ -1024,11 +1164,12 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                         .unwrap_or_default();
                     let row_count = generic.as_ref().map(|g| g.1.len()).unwrap_or(rows.len());
                     println!(
-                        "  {SYM_OK}  [SSH] {:14} ({:12}) -> {:>5} match(es) across {:>4} remote file(s)",
+                        "  {SYM_OK}  [SSH] {:14} ({:12}) -> {:>5} match(es) across {:>4} remote file(s) in {:.2}s",
                         srv.name,
                         srv.ip,
                         row_count,
-                        files_count
+                        files_count,
+                        srv_secs
                     );
                     summaries.push(FleetServerSummary {
                         server_name: srv.name.clone(),
@@ -1036,6 +1177,10 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                         success: true,
                         total_errors: row_count,
                         log_files_scanned: files_count,
+                        log_files_total: files_count,
+                        lines_scanned: row_count,
+                        bytes_scanned: 0,
+                        elapsed_seconds: format!("{:.2}", srv_secs),
                         engine: "lpr-ssh-linux".to_string(),
                         first_error: first_err,
                         last_error: last_err,
@@ -1051,9 +1196,10 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                     all_errors.extend(rows);
                 }
                 Err(e) => {
+                    let srv_secs = srv_start.elapsed().as_secs_f64();
                     println!(
-                        "  {SYM_WARN}  [SSH] {:14} ({:12}) -> Failed: {}",
-                        srv.name, srv.ip, e
+                        "  {SYM_WARN}  [SSH] {:14} ({:12}) -> Failed in {:.2}s: {}",
+                        srv.name, srv.ip, srv_secs, e
                     );
                     failed_servers.push(srv.name.clone());
                     summaries.push(FleetServerSummary {
@@ -1062,6 +1208,10 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                         success: false,
                         total_errors: 0,
                         log_files_scanned: 0,
+                        log_files_total: 0,
+                        lines_scanned: 0,
+                        bytes_scanned: 0,
+                        elapsed_seconds: format!("{:.2}", srv_secs),
                         engine: "lpr-ssh-linux".to_string(),
                         first_error: String::new(),
                         last_error: String::new(),
@@ -1073,60 +1223,71 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             continue;
         }
 
-        let mut candidate_paths: Vec<String> = Vec::new();
+        let mut existing_paths: Vec<String> = Vec::new();
+        let mut tried_paths: Vec<String> = Vec::new();
 
         // If alternate SMB credentials are configured, establish a `net use` IPC$ session first (Windows only).
         #[cfg(windows)]
         let _smb_guard = establish_smb_session(srv, &profile, resolved_smb_secret.as_deref());
 
-        // 1. Expand user-configured log_path / archive_path / path_templates (converting local D:\... to \\server\d$\... automatically!)
+        // 1. Expand user-configured log_path / archive_path / path_templates (converting local D:\... to \\server\d$\... automatically!).
+        // Avoid adding BOTH \\ServerName\... and \\ServerIP\... for the same template so we never scan the same server share twice!
         for tpl in &path_templates {
             let expanded = expand_remote_path_template(tpl, &srv.name, &srv.ip, &site_name);
-            if !candidate_paths.contains(&expanded) {
-                candidate_paths.push(expanded);
-            }
-            if !srv.ip.is_empty() && srv.ip != srv.name {
+            tried_paths.push(expanded.clone());
+            if Path::new(&expanded).exists() {
+                if !existing_paths.contains(&expanded) {
+                    existing_paths.push(expanded);
+                }
+            } else if !srv.ip.is_empty() && srv.ip != srv.name {
                 let expanded_ip = expand_remote_path_template(tpl, &srv.ip, &srv.ip, &site_name);
-                if !candidate_paths.contains(&expanded_ip) {
-                    candidate_paths.push(expanded_ip);
+                tried_paths.push(expanded_ip.clone());
+                if Path::new(&expanded_ip).exists() && !existing_paths.contains(&expanded_ip) {
+                    existing_paths.push(expanded_ip);
                 }
             }
         }
 
-        // 2. If Auto-Discovery is enabled, check IIS applicationHost.config AND Linux Nginx/Apache/Caddy vhost configs!
-        if profile.iis_auto_discover.unwrap_or(true) {
+        // 2. Only probe IIS applicationHost.config / Linux vhost auto-discovery if no explicit path_templates matched (or --iis-auto was passed)
+        if existing_paths.is_empty() && profile.iis_auto_discover.unwrap_or(true) {
             if !site_name.is_empty() {
                 for host_target in [&srv.name, &srv.ip] {
                     if !host_target.is_empty() {
                         for discovered in
                             discover_iis_site_log_paths_on_server(host_target, &site_name)
                         {
-                            if !candidate_paths.contains(&discovered) {
-                                candidate_paths.push(discovered);
+                            tried_paths.push(discovered.clone());
+                            if Path::new(&discovered).exists()
+                                && !existing_paths.contains(&discovered)
+                            {
+                                existing_paths.push(discovered);
                             }
+                        }
+                        if !existing_paths.is_empty() {
+                            break;
                         }
                     }
                 }
             }
-            for discovered_linux in discover_local_linux_webserver_logs(&site_name) {
-                if !candidate_paths.contains(&discovered_linux) {
-                    candidate_paths.push(discovered_linux);
+            if existing_paths.is_empty() {
+                for discovered_linux in discover_local_linux_webserver_logs(&site_name) {
+                    if Path::new(&discovered_linux).exists()
+                        && !existing_paths.contains(&discovered_linux)
+                    {
+                        existing_paths.push(discovered_linux);
+                    }
                 }
             }
         }
 
-        let existing_paths: Vec<String> = candidate_paths
-            .iter()
-            .filter(|p| Path::new(p).exists())
-            .cloned()
-            .collect();
-
         if existing_paths.is_empty() {
+            let srv_secs = srv_start.elapsed().as_secs_f64();
             println!(
-                "  {SYM_WARN}  {:18} ({:12}) -> Path not accessible ({})",
+                "  {SYM_WARN}  {:18} ({:12}) -> Path not accessible in {:.2}s ({})",
                 srv.name,
                 srv.ip,
-                candidate_paths.first().cloned().unwrap_or_default()
+                srv_secs,
+                tried_paths.first().cloned().unwrap_or_default()
             );
             failed_servers.push(srv.name.clone());
             summaries.push(FleetServerSummary {
@@ -1135,16 +1296,19 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 success: false,
                 total_errors: 0,
                 log_files_scanned: 0,
+                log_files_total: 0,
+                lines_scanned: 0,
+                bytes_scanned: 0,
+                elapsed_seconds: format!("{:.2}", srv_secs),
                 engine: "lpr-native".to_string(),
                 first_error: String::new(),
                 last_error: String::new(),
                 scanned_paths: String::new(),
-                error_message: format!("Paths not accessible: {}", candidate_paths.join("; ")),
+                error_message: format!("Paths not accessible: {}", tried_paths.join("; ")),
             });
             continue;
         }
 
-        let joined_pattern = existing_paths.join(";");
         let cutoff_naive = chrono::NaiveDate::parse_from_str(&cutoff_date, "%Y-%m-%d")
             .unwrap_or_else(|_| chrono::Utc::now().date_naive());
         let cutoff_dt = cutoff_time.as_ref().and_then(|t| {
@@ -1154,7 +1318,45 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             )
             .ok()
         });
-        let all_items = resolve_source_items(&joined_pattern).unwrap_or_default();
+
+        // For short windows (--latest, --hours <= 24, or --days 1), resolve primary live log paths first
+        // so we don't enumerate thousands of historical files in Archive/Old folders unless needed!
+        let is_short_window = latest_only || hours.map(|h| h <= 24).unwrap_or(days <= 1);
+        let live_only_paths: Vec<String> = existing_paths
+            .iter()
+            .filter(|p| {
+                let pl = p.to_ascii_lowercase();
+                !pl.contains("old") && !pl.contains("archive") && !pl.contains("backup")
+            })
+            .cloned()
+            .collect();
+
+        let (active_scan_paths, all_items) = if is_short_window
+            && !live_only_paths.is_empty()
+            && live_only_paths.len() < existing_paths.len()
+        {
+            let live_joined = live_only_paths.join(";");
+            let live_items =
+                resolve_source_items_with_cutoff(&live_joined, Some(cutoff_naive))
+                    .unwrap_or_default();
+            if !live_items.is_empty() {
+                (live_only_paths, live_items)
+            } else {
+                let full_joined = existing_paths.join(";");
+                let full_items =
+                    resolve_source_items_with_cutoff(&full_joined, Some(cutoff_naive))
+                        .unwrap_or_default();
+                (existing_paths.clone(), full_items)
+            }
+        } else {
+            let full_joined = existing_paths.join(";");
+            let full_items =
+                resolve_source_items_with_cutoff(&full_joined, Some(cutoff_naive))
+                    .unwrap_or_default();
+            (existing_paths.clone(), full_items)
+        };
+
+        let joined_pattern = active_scan_paths.join(";");
         let total_files = all_items.len();
         let items = match cutoff_dt {
             Some(cdt) => filter_items_by_datetime(all_items, cdt),
@@ -1167,9 +1369,10 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         };
         let files_count = items.len();
         if items.is_empty() {
+            let srv_secs = srv_start.elapsed().as_secs_f64();
             println!(
-                "  {SYM_OK}  {:18} ({:12}) [Skip] ->     0 match(es) across    0 of {:>4} log file(s) in date window",
-                srv.name, srv.ip, total_files
+                "  {SYM_OK}  {:18} ({:12}) [Skip] ->     0 match(es) |    0/{:>4} files |           0 lines | {:>5.2}s",
+                srv.name, srv.ip, total_files, srv_secs
             );
             summaries.push(FleetServerSummary {
                 server_name: srv.name.clone(),
@@ -1177,25 +1380,50 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 success: true,
                 total_errors: 0,
                 log_files_scanned: 0,
+                log_files_total: total_files,
+                lines_scanned: 0,
+                bytes_scanned: 0,
+                elapsed_seconds: format!("{:.2}", srv_secs),
                 engine: "lpr-window-skip".to_string(),
                 first_error: String::new(),
                 last_error: String::new(),
-                scanned_paths: existing_paths.join("; "),
+                scanned_paths: active_scan_paths.join("; "),
                 error_message: String::new(),
             });
             continue;
         }
-        let pre_filter = ScanPreFilter {
-            min_date: Some(cutoff_date.clone()),
-            min_time: cutoff_time.clone(),
-            status_prefix: if custom_sql.is_some() {
-                None
-            } else {
-                Some(status_prefix.clone())
-            },
-        };
+        if !learned_during_scan
+            && (req.learn_intelligence || (trace_active && profile.session_intelligence.is_none()))
+        {
+            let sample_subset: Vec<_> = keep_latest_log_item(items.clone())
+                .into_iter()
+                .take(2)
+                .collect();
+            if let Ok(intel) = learn_session_intelligence_from_items(&sample_subset, threads).await
+            {
+                print_session_intelligence_summary(&active_profile_name, &intel);
+                profile.session_intelligence = Some(intel);
+                cfg_store
+                    .profiles
+                    .insert(active_profile_name.clone(), profile.clone());
+                let _ = cfg_store.save(req.cfg_file_path.as_deref());
+                learned_during_scan = true;
+            }
+            if req.learn_intelligence && !trace_active {
+                return Ok(());
+            }
+        }
+        let pre_filter = base_pre_filter.clone();
         let engine = LogEngine::with_options(threads, verbose);
         let input_fmt = parse_stack_input_format(&server_type);
+        if trace_active {
+            resolved_server_sources.push((
+                srv.clone(),
+                items.clone(),
+                joined_pattern.clone(),
+                input_fmt,
+            ));
+        }
         match engine
             .register_source_items_filtered(
                 "logs",
@@ -1209,6 +1437,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
             .await
         {
             Ok(detected_fmt) => {
+                let p_stats = engine.get_last_stats();
                 let cols = engine.table_columns("logs").await;
                 let sql = custom_sql.clone().unwrap_or_else(|| {
                     build_multi_format_error_sql(
@@ -1220,12 +1449,18 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                 });
                 match engine.query(&sql).await {
                     Ok(batches) => {
+                        let srv_secs = srv_start.elapsed().as_secs_f64();
                         let (rows, row_count) = if custom_sql.is_some() {
                             let grows =
                                 extract_generic_rows(&batches, &mut custom_cols, &srv.name, &srv.ip);
                             let n = grows.len();
                             custom_rows.extend(grows);
-                            (Vec::new(), n)
+                            let trace_rows = if trace_active {
+                                extract_fleet_rows(&batches, &srv.name, &srv.ip)
+                            } else {
+                                Vec::new()
+                            };
+                            (trace_rows, n)
                         } else {
                             let rows = extract_fleet_rows(&batches, &srv.name, &srv.ip);
                             let n = rows.len();
@@ -1240,13 +1475,15 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                             .map(|r| format!("{} {}", r.date, r.time))
                             .unwrap_or_default();
                         println!(
-                            "  {SYM_OK}  {:18} ({:12}) [{:?}] -> {:>5} match(es) across {:>4} of {:>4} log file(s)",
+                            "  {SYM_OK}  {:18} ({:12}) [{:?}] -> {:>5} match(es) | {:>4}/{:>4} files | {:>11} lines | {:>5.2}s",
                             srv.name,
                             srv.ip,
                             detected_fmt,
                             row_count,
                             files_count,
-                            total_files
+                            total_files,
+                            format_int_commas(p_stats.total_lines),
+                            srv_secs
                         );
                         summaries.push(FleetServerSummary {
                             server_name: srv.name.clone(),
@@ -1254,15 +1491,24 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                             success: true,
                             total_errors: row_count,
                             log_files_scanned: files_count,
+                            log_files_total: total_files,
+                            lines_scanned: p_stats.total_lines,
+                            bytes_scanned: p_stats.total_bytes,
+                            elapsed_seconds: format!("{:.2}", srv_secs),
                             engine: format!("lpr-{:?}", detected_fmt),
                             first_error: first_err,
                             last_error: last_err,
-                            scanned_paths: existing_paths.join("; "),
+                            scanned_paths: active_scan_paths.join("; "),
                             error_message: String::new(),
                         });
                         all_errors.extend(rows);
                     }
                     Err(e) => {
+                        let srv_secs = srv_start.elapsed().as_secs_f64();
+                        println!(
+                            "  {SYM_WARN}  {:18} ({:12}) -> SQL Error in {:.2}s: {}",
+                            srv.name, srv.ip, srv_secs, e
+                        );
                         failed_servers.push(srv.name.clone());
                         summaries.push(FleetServerSummary {
                             server_name: srv.name.clone(),
@@ -1270,16 +1516,25 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                             success: false,
                             total_errors: 0,
                             log_files_scanned: files_count,
+                            log_files_total: total_files,
+                            lines_scanned: p_stats.total_lines,
+                            bytes_scanned: p_stats.total_bytes,
+                            elapsed_seconds: format!("{:.2}", srv_secs),
                             engine: "lpr-native-parallel".to_string(),
                             first_error: String::new(),
                             last_error: String::new(),
-                            scanned_paths: existing_paths.join("; "),
+                            scanned_paths: active_scan_paths.join("; "),
                             error_message: e.to_string(),
                         });
                     }
                 }
             }
             Err(e) => {
+                let srv_secs = srv_start.elapsed().as_secs_f64();
+                println!(
+                    "  {SYM_WARN}  {:18} ({:12}) -> Parse Error in {:.2}s: {}",
+                    srv.name, srv.ip, srv_secs, e
+                );
                 failed_servers.push(srv.name.clone());
                 summaries.push(FleetServerSummary {
                     server_name: srv.name.clone(),
@@ -1287,16 +1542,21 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
                     success: false,
                     total_errors: 0,
                     log_files_scanned: 0,
+                    log_files_total: total_files,
+                    lines_scanned: 0,
+                    bytes_scanned: 0,
+                    elapsed_seconds: format!("{:.2}", srv_secs),
                     engine: "lpr-native-parallel".to_string(),
                     first_error: String::new(),
                     last_error: String::new(),
-                    scanned_paths: existing_paths.join("; "),
+                    scanned_paths: active_scan_paths.join("; "),
                     error_message: e.to_string(),
                 });
             }
         }
     }
 
+    let total_fleet_secs = fleet_start.elapsed().as_secs_f64();
     write_fleet_reports(
         &output_dir,
         &report_prefix,
@@ -1313,7 +1573,29 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
         } else {
             None
         },
-    )
+        total_fleet_secs,
+    )?;
+
+    if trace_active && !all_errors.is_empty() && !resolved_server_sources.is_empty() {
+        run_cross_server_journey_tracer(
+            &resolved_server_sources,
+            &all_errors,
+            trace_id_clean.as_deref(),
+            req.trace_window_mins.max(1),
+            req.max_journeys.max(1),
+            profile.session_intelligence.as_ref(),
+            &cutoff_date,
+            cutoff_time.as_deref(),
+            &output_dir,
+            &report_prefix,
+            &run_stamp,
+            threads,
+            verbose,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1330,7 +1612,15 @@ async fn run_local_or_archive_fleet_scan(
     verbose: bool,
     custom_sql: Option<&str>,
     latest_only: bool,
+    base_pre_filter: &ScanPreFilter,
+    fleet_start: std::time::Instant,
+    trace_active: bool,
+    trace_id: Option<&str>,
+    trace_window_mins: i64,
+    max_journeys: usize,
+    session_intel: Option<&SessionIntelligence>,
 ) -> Result<()> {
+    let srv_start = std::time::Instant::now();
     let cutoff_naive = chrono::NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Utc::now().date_naive());
     let cutoff_dt = cutoff_time.and_then(|t| {
@@ -1340,10 +1630,11 @@ async fn run_local_or_archive_fleet_scan(
         )
         .ok()
     });
-    let items = resolve_source_items_with_cutoff(target_path, Some(cutoff_naive))?;
+    let all_items = resolve_source_items_with_cutoff(target_path, Some(cutoff_naive))?;
+    let total_files = all_items.len();
     let items = match cutoff_dt {
-        Some(cdt) => filter_items_by_datetime(items, cdt),
-        None => filter_items_by_min_date(items, cutoff_naive),
+        Some(cdt) => filter_items_by_datetime(all_items, cdt),
+        None => filter_items_by_min_date(all_items, cutoff_naive),
     };
     let items = if latest_only {
         keep_latest_log_item(items)
@@ -1354,15 +1645,8 @@ async fn run_local_or_archive_fleet_scan(
         anyhow::bail!("No log files on/after {} in {}", cutoff_date, target_path);
     }
     let files_scanned = items.len();
-    let pre_filter = ScanPreFilter {
-        min_date: Some(cutoff_date.to_string()),
-        min_time: cutoff_time.map(|t| t.to_string()),
-        status_prefix: if custom_sql.is_none() {
-            Some(status_prefix.to_string())
-        } else {
-            None
-        },
-    };
+    let items_for_trace = items.clone();
+    let pre_filter = base_pre_filter.clone();
     let engine = LogEngine::with_options(threads, verbose);
     let detected_fmt = engine
         .register_source_items_filtered(
@@ -1375,6 +1659,7 @@ async fn run_local_or_archive_fleet_scan(
             Some(&pre_filter),
         )
         .await?;
+    let p_stats = engine.get_last_stats();
     let cols = engine.table_columns("logs").await;
     let sql = custom_sql.map(|s| s.to_string()).unwrap_or_else(|| {
         build_multi_format_error_sql(&cols, status_prefix, cutoff_date, cutoff_time)
@@ -1388,6 +1673,9 @@ async fn run_local_or_archive_fleet_scan(
     if custom_sql.is_some() {
         custom_rows = extract_generic_rows(&batches, &mut custom_cols, "LOCAL-SERVER", "127.0.0.1");
         row_count = custom_rows.len();
+        if trace_active {
+            all_errors = extract_fleet_rows(&batches, "LOCAL-SERVER", "127.0.0.1");
+        }
     } else {
         all_errors = extract_fleet_rows(&batches, "LOCAL-SERVER", "127.0.0.1");
         row_count = all_errors.len();
@@ -1409,6 +1697,19 @@ async fn run_local_or_archive_fleet_scan(
         .first()
         .map(|r| r.server_ip.clone())
         .unwrap_or_default();
+    let srv_secs = srv_start.elapsed().as_secs_f64();
+
+    println!(
+        "  {SYM_OK}  {:18} ({:12}) [{:?}] -> {:>5} match(es) | {:>4}/{:>4} files | {:>11} lines | {:>5.2}s",
+        srv_name,
+        srv_ip,
+        detected_fmt,
+        row_count,
+        files_scanned,
+        total_files,
+        format_int_commas(p_stats.total_lines),
+        srv_secs
+    );
 
     let summaries = vec![FleetServerSummary {
         server_name: srv_name,
@@ -1416,6 +1717,10 @@ async fn run_local_or_archive_fleet_scan(
         success: true,
         total_errors: row_count,
         log_files_scanned: files_scanned,
+        log_files_total: total_files,
+        lines_scanned: p_stats.total_lines,
+        bytes_scanned: p_stats.total_bytes,
+        elapsed_seconds: format!("{:.2}", srv_secs),
         engine: format!("lpr-{:?}", detected_fmt),
         first_error: first_err,
         last_error: last_err,
@@ -1439,7 +1744,40 @@ async fn run_local_or_archive_fleet_scan(
         } else {
             None
         },
-    )
+        fleet_start.elapsed().as_secs_f64(),
+    )?;
+
+    if trace_active && !all_errors.is_empty() {
+        let local_srv = ServerEntry {
+            name: "LOCAL-SERVER".to_string(),
+            ip: "127.0.0.1".to_string(),
+            enabled: true,
+        };
+        let sources = vec![(
+            local_srv,
+            items_for_trace,
+            target_path.to_string(),
+            detected_fmt,
+        )];
+        run_cross_server_journey_tracer(
+            &sources,
+            &all_errors,
+            trace_id,
+            trace_window_mins.max(1),
+            max_journeys.max(1),
+            session_intel,
+            cutoff_date,
+            cutoff_time,
+            output_dir,
+            report_prefix,
+            run_stamp,
+            threads,
+            verbose,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn extract_generic_rows(
@@ -1593,6 +1931,39 @@ fn extract_fleet_rows(
                     .unwrap_or("")
                     .to_string();
 
+                let raw_xff = obj["x_forwarded_for"]
+                    .as_str()
+                    .or_else(|| obj["csx_forwarded_for"].as_str())
+                    .or_else(|| obj["cf_connecting_ip"].as_str())
+                    .or_else(|| obj["true_client_ip"].as_str())
+                    .or_else(|| obj["x_real_ip"].as_str())
+                    .or_else(|| obj["forwarded_for"].as_str())
+                    .unwrap_or("");
+                let forwarded_ip = raw_xff
+                    .split([',', ';', '+'])
+                    .next()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && *s != "-")
+                    .unwrap_or("")
+                    .to_string();
+
+                let cookie = obj["cscookie"]
+                    .as_str()
+                    .or_else(|| obj["cs_cookie"].as_str())
+                    .or_else(|| obj["cookie"].as_str())
+                    .filter(|s| *s != "-")
+                    .unwrap_or("")
+                    .to_string();
+
+                let redirect_location = obj["sclocation"]
+                    .as_str()
+                    .or_else(|| obj["sc_location"].as_str())
+                    .or_else(|| obj["location"].as_str())
+                    .or_else(|| obj["redirect_url"].as_str())
+                    .filter(|s| *s != "-")
+                    .unwrap_or("")
+                    .to_string();
+
                 rows.push(FleetErrorRow {
                     server_name: effective_srv.to_string(),
                     server_ip: effective_ip.to_string(),
@@ -1610,6 +1981,9 @@ fn extract_fleet_rows(
                     referer,
                     log_file,
                     log_row,
+                    forwarded_ip,
+                    cookie,
+                    redirect_location,
                 });
             }
         }
@@ -1617,7 +1991,35 @@ fn extract_fleet_rows(
     rows
 }
 
-#[allow(clippy::too_many_arguments)]
+fn format_int_commas(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (idx, &b) in bytes.iter().enumerate() {
+        if idx > 0 && (bytes.len() - idx) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_fleet_reports(
     output_dir: &str,
@@ -1631,6 +2033,7 @@ fn write_fleet_reports(
     summaries: &[FleetServerSummary],
     failed_servers: &[String],
     custom_detail: Option<(&[String], &[Vec<String>])>,
+    total_fleet_secs: f64,
 ) -> Result<()> {
     let safe_prefix: String = report_prefix
         .chars()
@@ -1675,18 +2078,51 @@ fn write_fleet_reports(
     }
 
     let succeeded = summaries.iter().filter(|s| s.success).count();
+    let servers_skipped = summaries
+        .iter()
+        .filter(|s| s.success && s.log_files_scanned == 0)
+        .count();
+    let servers_scanned_active = succeeded.saturating_sub(servers_skipped);
+    let servers_with_matches = summaries.iter().filter(|s| s.total_errors > 0).count();
+
+    let files_total: usize = summaries.iter().map(|s| s.log_files_total).sum();
+    let files_scanned: usize = summaries.iter().map(|s| s.log_files_scanned).sum();
+    let files_skipped = files_total.saturating_sub(files_scanned);
+
+    let lines_total: usize = summaries.iter().map(|s| s.lines_scanned).sum();
+    let bytes_total: u64 = summaries.iter().map(|s| s.bytes_scanned).sum();
+    let total_matches = custom_detail
+        .map(|(_, rows)| rows.len())
+        .unwrap_or(all_errors.len());
+    let lines_filtered_out = lines_total.saturating_sub(total_matches);
+
+    let safe_secs = total_fleet_secs.max(0.001);
+    let avg_srv_secs = if !summaries.is_empty() {
+        total_fleet_secs / (summaries.len() as f64)
+    } else {
+        0.0
+    };
+    let lines_per_sec = ((lines_total as f64) / safe_secs).round() as usize;
+    let mb_per_sec = (bytes_total as f64 / (1024.0 * 1024.0)) / safe_secs;
+
     let manifest_content = format!(
-        "GeneratedUtc={}\nEngine=lpr-v{}\nDays={}\nCutoffDate={}\nServersRequested={}\nServersSucceeded={}\nServersFailed={}\nTotalErrors={}\nDetailCsv={}\nSummaryCsv={}\nFailedServers={}\n",
+        "GeneratedUtc={}\nEngine=lpr-v{}\nDays={}\nCutoffDate={}\nServersRequested={}\nServersSucceeded={}\nServersSkipped={}\nServersFailed={}\nServersWithMatches={}\nFilesTotal={}\nFilesScanned={}\nFilesSkipped={}\nLinesScanned={}\nBytesScanned={}\nTotalMatches={}\nTotalElapsedSeconds={:.2}\nDetailCsv={}\nSummaryCsv={}\nFailedServers={}\n",
         Utc::now().to_rfc3339(),
         env!("CARGO_PKG_VERSION"),
         days,
         cutoff_date,
         servers_requested,
         succeeded,
+        servers_skipped,
         failed_servers.len(),
-        custom_detail
-            .map(|(_, rows)| rows.len())
-            .unwrap_or(all_errors.len()),
+        servers_with_matches,
+        files_total,
+        files_scanned,
+        files_skipped,
+        lines_total,
+        bytes_total,
+        total_matches,
+        total_fleet_secs,
         detail_csv.to_string_lossy(),
         summary_csv.to_string_lossy(),
         failed_servers.join(",")
@@ -1694,14 +2130,72 @@ fn write_fleet_reports(
     fs::write(&manifest_txt, manifest_content)?;
 
     println!("--------------------------------------------------------------------------------");
-    println!(" {SYM_DONE} Fleet Scan Complete!");
-    let total_matches = custom_detail
-        .map(|(_, rows)| rows.len())
-        .unwrap_or(all_errors.len());
+    println!(
+        "               {:>12} {:>14} {:>12} {:>10} {:>13}",
+        "Total", "Scanned / OK", "Skipped", "Failed", "Matched"
+    );
+    println!(
+        "  Servers :    {:>12} {:>14} {:>12} {:>10} {:>13}",
+        format_int_commas(servers_requested),
+        format_int_commas(servers_scanned_active),
+        format_int_commas(servers_skipped),
+        format_int_commas(failed_servers.len()),
+        format!("{} srv(s)", servers_with_matches)
+    );
+    println!(
+        "  Files   :    {:>12} {:>14} {:>12} {:>10} {:>13}",
+        format_int_commas(files_total),
+        format_int_commas(files_scanned),
+        format_int_commas(files_skipped),
+        "0",
+        "--"
+    );
+    println!(
+        "  Lines   :    {:>12} {:>14} {:>12} {:>10} {:>13}",
+        format_int_commas(lines_total),
+        format_int_commas(lines_total),
+        format_int_commas(lines_filtered_out),
+        "0",
+        format_int_commas(total_matches)
+    );
+    println!(
+        "  Volume  :    {:>12} {:>14} {:>12} {:>10} {:>13}",
+        format_bytes_human(bytes_total),
+        format_bytes_human(bytes_total),
+        "--",
+        "0 B",
+        format!("{} rows", format_int_commas(total_matches))
+    );
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        "  Speed   :    {:.2} MB/sec | {} lines/sec | Threads: Parallel Rayon + Arrow",
+        mb_per_sec,
+        format_int_commas(lines_per_sec)
+    );
+    println!(
+        "  Times   :    Total: {:.2}s | Avg/Server: {:.2}s | Ended: {}",
+        total_fleet_secs,
+        avg_srv_secs,
+        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    println!("--------------------------------------------------------------------------------");
     if custom_detail.is_some() {
-        println!(" {SYM_CHART} Total Matches    : {}", total_matches);
+        println!(
+            " {SYM_DONE} Fleet Scan Complete — {} matching row(s) found across {}/{} server(s) in {:.2}s",
+            format_int_commas(total_matches),
+            servers_with_matches,
+            servers_requested,
+            total_fleet_secs
+        );
     } else {
-        println!(" {SYM_CHART} Total {}xx Matches : {}", status_prefix, total_matches);
+        println!(
+            " {SYM_DONE} Fleet Scan Complete — {} ({}xx) match(es) found across {}/{} server(s) in {:.2}s",
+            format_int_commas(total_matches),
+            status_prefix,
+            servers_with_matches,
+            servers_requested,
+            total_fleet_secs
+        );
     }
     println!(" {SYM_FILE} Detail CSV        : {}", detail_csv.to_string_lossy());
     println!(" {SYM_LIST} Summary CSV       : {}", summary_csv.to_string_lossy());
@@ -2282,16 +2776,16 @@ fn default_path_templates_for_stack(
         }
     } else if !site_name.is_empty() {
         vec![
-            r"\\{server}\d$\emLogs\{site}".to_string(),
-            r"\\{server}\d$\emLogs\OldIISLogs\{site}".to_string(),
             r"\\{server}\c$\inetpub\logs\LogFiles\{site}".to_string(),
+            r"\\{server}\d$\Logs\{site}".to_string(),
+            r"\\{server}\d$\IISLogs\{site}".to_string(),
             format!("/var/log/nginx/{}", site_name),
             format!("/var/log/apache2/{}", site_name),
         ]
     } else {
         vec![
             r"\\{server}\c$\inetpub\logs\LogFiles".to_string(),
-            r"\\{server}\d$\emLogs".to_string(),
+            r"\\{server}\d$\Logs".to_string(),
             "/var/log/nginx".to_string(),
             "/var/log/apache2".to_string(),
             "/var/log/httpd".to_string(),
@@ -2318,7 +2812,11 @@ fn build_multi_format_error_sql(
     cutoff_date: &str,
     cutoff_time: Option<&str>,
 ) -> String {
-    let safe_status: String = status_prefix
+    let trimmed_sp = status_prefix.trim();
+    let match_all_status = trimmed_sp == "*"
+        || trimmed_sp.eq_ignore_ascii_case("all")
+        || trimmed_sp.eq_ignore_ascii_case("any");
+    let safe_status: String = trimmed_sp
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .collect();
@@ -2342,6 +2840,16 @@ fn build_multi_format_error_sql(
         }
         _ => format!("date >= '{}'", safe_cutoff),
     };
+    if match_all_status {
+        if has("date") && has("time") {
+            return format!(
+                "SELECT * FROM logs WHERE {} ORDER BY date, time",
+                date_clause
+            );
+        } else {
+            return "SELECT * FROM logs".to_string();
+        }
+    }
     if has("sc_status") && has("date") {
         format!(
             "SELECT * FROM logs WHERE sc_status LIKE '{}%' AND {} ORDER BY date, time",
@@ -2613,4 +3121,927 @@ async fn scan_linux_server_via_ssh(
         1,
         format!("ssh://{}:{}", ssh_target, dirs_arg),
     ))
+}
+
+// ================================================================================================
+// DETERMINISTIC SESSION INTELLIGENCE LEARNER & CROSS-SERVER USER JOURNEY ENGINE (ZERO AI)
+// ================================================================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FleetJourneyCsvRow {
+    #[serde(rename = "JourneyID")]
+    pub journey_id: usize,
+    #[serde(rename = "ActorIdentity")]
+    pub actor_identity: String,
+    #[serde(rename = "MatchedBy")]
+    pub matched_by: String,
+    #[serde(rename = "StepNumber")]
+    pub step_number: usize,
+    #[serde(rename = "StepRole")]
+    pub step_role: String,
+    #[serde(rename = "DeltaSeconds")]
+    pub delta_seconds: String,
+    #[serde(rename = "ServerHop")]
+    pub server_hop: String,
+    #[serde(rename = "ServerName")]
+    pub server_name: String,
+    #[serde(rename = "ServerIP")]
+    pub server_ip: String,
+    #[serde(rename = "Date")]
+    pub date: String,
+    #[serde(rename = "Time")]
+    pub time: String,
+    #[serde(rename = "ClientIP")]
+    pub client_ip: String,
+    #[serde(rename = "ForwardedIP")]
+    pub forwarded_ip: String,
+    #[serde(rename = "Method")]
+    pub method: String,
+    #[serde(rename = "Status")]
+    pub status: String,
+    #[serde(rename = "SubStatus")]
+    pub sub_status: String,
+    #[serde(rename = "TimeTakenMs")]
+    pub time_taken_ms: String,
+    #[serde(rename = "UriStem")]
+    pub uri_stem: String,
+    #[serde(rename = "UriQuery")]
+    pub uri_query: String,
+    #[serde(rename = "RedirectTarget")]
+    pub redirect_target: String,
+    #[serde(rename = "Referer")]
+    pub referer: String,
+    #[serde(rename = "UserAgent")]
+    pub user_agent: String,
+    #[serde(rename = "LogFile")]
+    pub log_file: String,
+    #[serde(rename = "LogRow")]
+    pub log_row: String,
+}
+
+fn is_identity_key_name(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "session",
+        "sess",
+        "sid",
+        "phpsessid",
+        "jsessionid",
+        "asp.net_sessionid",
+        "aspsessionid",
+        "customer",
+        "cust",
+        "userid",
+        "user_id",
+        "visitor",
+        "visit",
+        "cart",
+        "basket",
+        "order",
+        "payment",
+        "checkout",
+        "token",
+        "auth",
+        "shop_session",
+        "cf_clearance",
+        "_ga",
+        "guid",
+        "uuid",
+        "correlation",
+        "trace",
+        "transaction",
+    ];
+    PATTERNS.iter().any(|p| k.contains(p))
+}
+
+fn is_ignored_static_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    matches!(
+        k.as_str(),
+        "lang"
+            | "language"
+            | "locale"
+            | "country"
+            | "currency"
+            | "page"
+            | "sort"
+            | "limit"
+            | "offset"
+            | "size"
+            | "color"
+            | "category"
+            | "v"
+            | "ver"
+            | "version"
+            | "format"
+    )
+}
+
+/// Parses `cs(Cookie)` strings (`name=val; name2=val2` or IIS `+`-separated `name=val;+name2=val2`) into `(name, value)` pairs.
+fn parse_cookie_pairs(raw_cookie: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let trimmed = raw_cookie.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return out;
+    }
+    for part in trimmed.split(';') {
+        let clean = part.trim().trim_start_matches('+').trim();
+        if let Some((k, v)) = clean.split_once('=') {
+            let k_clean = k.trim();
+            let v_clean = v.trim().trim_matches('"');
+            if !k_clean.is_empty() && v_clean.len() >= 3 && v_clean != "-" {
+                out.push((k_clean.to_string(), v_clean.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Parses `cs-uri-query` strings (`k=v&k2=v2`) into `(name, value)` pairs.
+fn parse_query_pairs(raw_query: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let trimmed = raw_query.trim().trim_start_matches('?');
+    if trimmed.is_empty() || trimmed == "-" {
+        return out;
+    }
+    for part in trimmed.split('&') {
+        if let Some((k, v)) = part.split_once('=') {
+            let k_clean = k.trim();
+            let v_clean = v.trim();
+            if !k_clean.is_empty() && v_clean.len() >= 2 && v_clean != "-" {
+                out.push((k_clean.to_string(), v_clean.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Deterministically analyzes a sample of log files to discover:
+/// - Available W3C/log columns
+/// - Client IP & Forwarded IP columns (`x_forwarded_for`, `cf_connecting_ip`, `c_ip`, etc.)
+/// - High-cardinality identity/session cookies (`cs(Cookie)`) using cardinality & repeat-hit statistics
+/// - Query-string correlation parameters (`cs-uri-query`)
+/// - Redirect target column (`sc(Location)`)
+pub async fn learn_session_intelligence_from_items(
+    items: &[crate::parsers::LogSourceItem],
+    threads: Option<usize>,
+) -> Result<SessionIntelligence> {
+    if items.is_empty() {
+        anyhow::bail!("No log files available to learn session intelligence");
+    }
+    let engine = LogEngine::with_options(threads, false);
+    engine
+        .register_source_items_filtered(
+            "logs",
+            items.to_vec(),
+            InputFormat::Auto,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let cols = engine.table_columns("logs").await;
+    let batches = engine.query("SELECT * FROM logs LIMIT 10000").await?;
+    let rows = extract_fleet_rows(&batches, "SAMPLE", "127.0.0.1");
+
+    // 1. Discover IP columns in priority order (Forwarded-For first, then c_ip)
+    let mut ip_cols = Vec::new();
+    for candidate in [
+        "x_forwarded_for",
+        "csx_forwarded_for",
+        "cf_connecting_ip",
+        "true_client_ip",
+        "x_real_ip",
+        "forwarded_for",
+        "client_ip",
+        "c_ip",
+        "remote_addr",
+    ] {
+        if cols.iter().any(|c| c.eq_ignore_ascii_case(candidate)) {
+            ip_cols.push(candidate.to_string());
+        }
+    }
+
+    // 2. Discover redirect location column if logged
+    let redirect_col = ["sclocation", "sc_location", "location", "redirect_url"]
+        .into_iter()
+        .find(|cand| cols.iter().any(|c| c.eq_ignore_ascii_case(cand)))
+        .map(|s| s.to_string());
+
+    // 3. Score cookie keys by cardinality & repeat-visit continuity (Zero AI)
+    // Map: cookie_name -> HashMap<cookie_value, hit_count>
+    let mut cookie_stats: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut query_stats: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+
+    for r in &rows {
+        for (k, v) in parse_cookie_pairs(&r.cookie) {
+            if !is_ignored_static_key(&k) {
+                *cookie_stats.entry(k).or_default().entry(v).or_insert(0) += 1;
+            }
+        }
+        for (k, v) in parse_query_pairs(&r.uri_query) {
+            if !is_ignored_static_key(&k) {
+                *query_stats.entry(k).or_default().entry(v).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut scored_cookies: Vec<(String, usize)> = cookie_stats
+        .into_iter()
+        .filter_map(|(k, val_map)| {
+            let unique_vals = val_map.len();
+            let multi_hit_vals = val_map.values().filter(|&&c| c >= 2).count();
+            let avg_val_len =
+                val_map.keys().map(|v| v.len()).sum::<usize>() / unique_vals.max(1);
+            let name_match = is_identity_key_name(&k);
+            // Keep if it matches known session/customer/cart naming OR has >= 2 distinct values with session-like length
+            if name_match || (unique_vals >= 2 && avg_val_len >= 6) {
+                let score = (if name_match { 1000 } else { 0 })
+                    + unique_vals * 10
+                    + multi_hit_vals * 25
+                    + avg_val_len.min(64);
+                Some((k, score))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored_cookies.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut identity_cookies: Vec<String> =
+        scored_cookies.into_iter().take(10).map(|(k, _)| k).collect();
+    if identity_cookies.is_empty() {
+        // Default enterprise IIS/web session cookie priority list when sample had no cookies yet
+        identity_cookies = vec![
+            "ASP.NET_SessionId".to_string(),
+            "SessionId".to_string(),
+            "shop_session".to_string(),
+            "customerId".to_string(),
+            "visitorId".to_string(),
+            "cartId".to_string(),
+            "PHPSESSID".to_string(),
+            "JSESSIONID".to_string(),
+        ];
+    }
+
+    let mut scored_queries: Vec<(String, usize)> = query_stats
+        .into_iter()
+        .filter_map(|(k, val_map)| {
+            let unique_vals = val_map.len();
+            let multi_hit_vals = val_map.values().filter(|&&c| c >= 2).count();
+            let name_match = is_identity_key_name(&k);
+            if name_match || (unique_vals >= 2 && multi_hit_vals >= 1) {
+                let score =
+                    (if name_match { 1000 } else { 0 }) + unique_vals * 10 + multi_hit_vals * 25;
+                Some((k, score))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored_queries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut query_correlators: Vec<String> =
+        scored_queries.into_iter().take(10).map(|(k, _)| k).collect();
+    if query_correlators.is_empty() {
+        query_correlators = vec![
+            "customerId".to_string(),
+            "customer_id".to_string(),
+            "orderId".to_string(),
+            "order_id".to_string(),
+            "paymentId".to_string(),
+            "cartId".to_string(),
+            "sessionId".to_string(),
+            "token".to_string(),
+        ];
+    }
+
+    Ok(SessionIntelligence {
+        learned_at_utc: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        sample_rows_analyzed: rows.len(),
+        detected_columns: cols,
+        identity_cookies,
+        query_correlators,
+        client_ip_columns: ip_cols,
+        redirect_location_column: redirect_col,
+    })
+}
+
+pub fn print_session_intelligence_summary(profile_name: &str, intel: &SessionIntelligence) {
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        " {SYM_BRAIN} DETERMINISTIC SESSION INTELLIGENCE LEARNED & SAVED (Profile: `{}`)",
+        profile_name
+    );
+    println!(
+        "    Sample Analyzed   : {} log rows | Columns Detected: {}",
+        format_int_commas(intel.sample_rows_analyzed),
+        intel.detected_columns.len()
+    );
+    println!(
+        "    Client IP Columns : {:?}",
+        intel.client_ip_columns
+    );
+    println!(
+        "    Identity Cookies  : {:?}",
+        intel.identity_cookies
+    );
+    println!(
+        "    Query Correlators : {:?}",
+        intel.query_correlators
+    );
+    println!(
+        "    Redirect Column   : {:?}",
+        intel
+            .redirect_location_column
+            .as_deref()
+            .unwrap_or("Not logged (will infer 302 target from next chronological hit)")
+    );
+    println!("--------------------------------------------------------------------------------");
+}
+
+#[derive(Debug, Clone)]
+struct JourneyActor {
+    /// Human-readable label for the customer/session (e.g. `Cookie:ASP.NET_SessionId=8f92a...` or `IP:198.51.100.42`)
+    actor_label: String,
+    /// How this actor was correlated (`Cookie`, `QueryParam`, `ForwardedIP+UA`, `ClientIP+UA`, `DirectTraceID`)
+    matched_by: String,
+    /// Raw ASCII substrings (`session_val`, `customer_id`, `forwarded_ip`, `client_ip`) used for raw-byte pushdown across all 24 servers
+    raw_needles: Vec<String>,
+    /// Exact cookie values `(key, val)` belonging to this actor
+    cookie_tokens: Vec<(String, String)>,
+    /// Exact query parameter values `(key, val)` belonging to this actor
+    query_tokens: Vec<(String, String)>,
+    /// Forwarded IP (`X-Forwarded-For`) if present
+    forwarded_ip: String,
+    /// Clear Client IP (`c-ip`)
+    client_ip: String,
+    /// User-Agent string (used when falling back to IP+UA correlation)
+    user_agent: String,
+}
+
+impl JourneyActor {
+    fn matches_row(&self, row: &FleetErrorRow, explicit_trace_id: Option<&str>) -> Option<String> {
+        if let Some(tid) = explicit_trace_id {
+            let tl = tid.to_ascii_lowercase();
+            if row.cookie.to_ascii_lowercase().contains(&tl)
+                || row.uri_query.to_ascii_lowercase().contains(&tl)
+                || row.uri_stem.to_ascii_lowercase().contains(&tl)
+                || row.forwarded_ip.eq_ignore_ascii_case(tid)
+                || row.client_ip.eq_ignore_ascii_case(tid)
+            {
+                return Some(format!("TraceID({})", tid));
+            }
+        }
+        // Tier 1: Identity Cookie match (works across non-sticky servers even if IP changes!)
+        if !self.cookie_tokens.is_empty() && !row.cookie.is_empty() {
+            let row_cookies = parse_cookie_pairs(&row.cookie);
+            for (tk, tv) in &self.cookie_tokens {
+                if row_cookies
+                    .iter()
+                    .any(|(rk, rv)| rk.eq_ignore_ascii_case(tk) && rv == tv)
+                {
+                    return Some(format!("Cookie({}={})", tk, tv));
+                }
+            }
+        }
+        // Tier 2: Query-String Correlator match (e.g. orderId, customerId, cartId, paymentId)
+        if !self.query_tokens.is_empty() && !row.uri_query.is_empty() {
+            let row_q = parse_query_pairs(&row.uri_query);
+            for (qk, qv) in &self.query_tokens {
+                if row_q
+                    .iter()
+                    .any(|(rk, rv)| rk.eq_ignore_ascii_case(qk) && rv == qv)
+                {
+                    return Some(format!("Query({}={})", qk, qv));
+                }
+            }
+        }
+        // Tier 3: X-Forwarded-For IP
+        if !self.forwarded_ip.is_empty()
+            && row.forwarded_ip.eq_ignore_ascii_case(&self.forwarded_ip)
+        {
+            return Some(
+                if !self.user_agent.is_empty() && row.user_agent == self.user_agent {
+                    format!("ForwardedIP+UA({})", self.forwarded_ip)
+                } else {
+                    format!("ForwardedIP({})", self.forwarded_ip)
+                },
+            );
+        }
+        // Tier 4: Clear Client IP (`c-ip`)
+        if !self.client_ip.is_empty() && row.client_ip.eq_ignore_ascii_case(&self.client_ip) {
+            return Some(
+                if !self.user_agent.is_empty() && row.user_agent == self.user_agent {
+                    format!("ClientIP+UA({})", self.client_ip)
+                } else {
+                    format!("ClientIP({})", self.client_ip)
+                },
+            );
+        }
+        None
+    }
+}
+
+fn build_actors_from_trigger_rows(
+    trigger_rows: &[FleetErrorRow],
+    explicit_trace_id: Option<&str>,
+    intel: Option<&SessionIntelligence>,
+    max_journeys: usize,
+) -> Vec<JourneyActor> {
+    let mut actors: Vec<JourneyActor> = Vec::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+
+    let id_cookies: Vec<String> = intel
+        .map(|i| i.identity_cookies.clone())
+        .unwrap_or_else(|| {
+            vec![
+                "ASP.NET_SessionId".to_string(),
+                "SessionId".to_string(),
+                "shop_session".to_string(),
+                "customerId".to_string(),
+                "visitorId".to_string(),
+                "cartId".to_string(),
+            ]
+        });
+    let q_keys: Vec<String> = intel
+        .map(|i| i.query_correlators.clone())
+        .unwrap_or_else(|| {
+            vec![
+                "customerId".to_string(),
+                "orderId".to_string(),
+                "paymentId".to_string(),
+                "cartId".to_string(),
+                "sessionId".to_string(),
+                "token".to_string(),
+            ]
+        });
+
+    for r in trigger_rows {
+        if actors.len() >= max_journeys {
+            break;
+        }
+        let mut cookie_tokens = Vec::new();
+        for (ck, cv) in parse_cookie_pairs(&r.cookie) {
+            if id_cookies.iter().any(|ic| ic.eq_ignore_ascii_case(&ck)) || is_identity_key_name(&ck)
+            {
+                cookie_tokens.push((ck, cv));
+            }
+        }
+        let mut query_tokens = Vec::new();
+        for (qk, qv) in parse_query_pairs(&r.uri_query) {
+            if q_keys.iter().any(|iq| iq.eq_ignore_ascii_case(&qk)) || is_identity_key_name(&qk) {
+                query_tokens.push((qk, qv));
+            }
+        }
+
+        // Determine primary actor identity key so multiple trigger hits from the same customer group into 1 journey
+        let (dedup_key, actor_label, matched_by) = if let Some(tid) = explicit_trace_id {
+            (
+                format!("TID:{}", tid.to_ascii_lowercase()),
+                format!("TraceID={}", tid),
+                "DirectTraceID".to_string(),
+            )
+        } else if let Some((ck, cv)) = cookie_tokens.first() {
+            (
+                format!("COOKIE:{}={}", ck.to_ascii_lowercase(), cv),
+                format!("{}={}", ck, cv),
+                format!("Cookie({})", ck),
+            )
+        } else if let Some((qk, qv)) = query_tokens.first() {
+            (
+                format!("QUERY:{}={}", qk.to_ascii_lowercase(), qv),
+                format!("{}={}", qk, qv),
+                format!("QueryParam({})", qk),
+            )
+        } else if !r.forwarded_ip.is_empty() {
+            (
+                format!("XFF:{}|{}", r.forwarded_ip, r.user_agent),
+                format!("ForwardedIP={}", r.forwarded_ip),
+                "ForwardedIP+UA".to_string(),
+            )
+        } else if !r.client_ip.is_empty() {
+            (
+                format!("CIP:{}|{}", r.client_ip, r.user_agent),
+                format!("ClientIP={}", r.client_ip),
+                "ClientIP+UA".to_string(),
+            )
+        } else {
+            continue;
+        };
+
+        if let Some(existing) = actors.iter_mut().find(|a| a.actor_label == actor_label) {
+            // Enrich existing actor with any newly seen cookie/query/IP on subsequent trigger rows
+            for ct in cookie_tokens {
+                if !existing.cookie_tokens.contains(&ct) {
+                    if ct.1.len() >= 4 {
+                        existing.raw_needles.push(ct.1.to_ascii_lowercase());
+                    }
+                    existing.cookie_tokens.push(ct);
+                }
+            }
+            for qt in query_tokens {
+                if !existing.query_tokens.contains(&qt) {
+                    if qt.1.len() >= 3 {
+                        existing.raw_needles.push(qt.1.to_ascii_lowercase());
+                    }
+                    existing.query_tokens.push(qt);
+                }
+            }
+            if existing.forwarded_ip.is_empty() && !r.forwarded_ip.is_empty() {
+                existing.forwarded_ip = r.forwarded_ip.clone();
+                existing
+                    .raw_needles
+                    .push(r.forwarded_ip.to_ascii_lowercase());
+            }
+            if existing.client_ip.is_empty() && !r.client_ip.is_empty() {
+                existing.client_ip = r.client_ip.clone();
+                existing.raw_needles.push(r.client_ip.to_ascii_lowercase());
+            }
+            continue;
+        }
+
+        if !seen_keys.insert(dedup_key) {
+            continue;
+        }
+
+        let mut raw_needles = Vec::new();
+        if let Some(tid) = explicit_trace_id {
+            raw_needles.push(tid.to_ascii_lowercase());
+        }
+        for (_, cv) in &cookie_tokens {
+            if cv.len() >= 4 {
+                raw_needles.push(cv.to_ascii_lowercase());
+            }
+        }
+        for (_, qv) in &query_tokens {
+            if qv.len() >= 3 {
+                raw_needles.push(qv.to_ascii_lowercase());
+            }
+        }
+        if !r.forwarded_ip.is_empty() {
+            raw_needles.push(r.forwarded_ip.to_ascii_lowercase());
+        }
+        if !r.client_ip.is_empty() {
+            raw_needles.push(r.client_ip.to_ascii_lowercase());
+        }
+        raw_needles.sort();
+        raw_needles.dedup();
+
+        actors.push(JourneyActor {
+            actor_label,
+            matched_by,
+            raw_needles,
+            cookie_tokens,
+            query_tokens,
+            forwarded_ip: r.forwarded_ip.clone(),
+            client_ip: r.client_ip.clone(),
+            user_agent: r.user_agent.clone(),
+        });
+    }
+
+    actors
+}
+
+fn parse_row_epoch_secs(date: &str, time: &str) -> Option<i64> {
+    let dt_str = format!("{} {}", date.trim(), time.trim());
+    chrono::NaiveDateTime::parse_from_str(&dt_str, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|ndt| ndt.and_utc().timestamp())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cross_server_journey_tracer(
+    server_sources: &[(
+        ServerEntry,
+        Vec<crate::parsers::LogSourceItem>,
+        String,
+        InputFormat,
+    )],
+    trigger_rows: &[FleetErrorRow],
+    explicit_trace_id: Option<&str>,
+    trace_window_mins: i64,
+    max_journeys: usize,
+    intel: Option<&SessionIntelligence>,
+    cutoff_date: &str,
+    cutoff_time: Option<&str>,
+    output_dir: &str,
+    report_prefix: &str,
+    run_stamp: &str,
+    threads: Option<usize>,
+    verbose: bool,
+) -> Result<()> {
+    let trace_start = std::time::Instant::now();
+    let actors =
+        build_actors_from_trigger_rows(trigger_rows, explicit_trace_id, intel, max_journeys);
+    if actors.is_empty() {
+        return Ok(());
+    }
+
+    // Collect union of all raw-byte search needles across all actors (Session IDs, Customer IDs, Forwarded IPs, Clear IPs)
+    let mut union_needles: Vec<String> = Vec::new();
+    for a in &actors {
+        for n in &a.raw_needles {
+            if !n.is_empty() && !union_needles.contains(n) {
+                union_needles.push(n.clone());
+            }
+        }
+    }
+
+    println!("================================================================================");
+    println!(
+        " {SYM_SEARCH} CROSS-SERVER USER JOURNEY RECONSTRUCTION (Tracing {} Customer/Session Actor(s) across {} Server(s))",
+        actors.len(),
+        server_sources.len()
+    );
+    println!(
+        " {SYM_ZAP} Journey Needles   : {:?} (Window: +/- {} mins around trigger events)",
+        union_needles, trace_window_mins
+    );
+    println!("--------------------------------------------------------------------------------");
+
+    let journey_pre_filter = ScanPreFilter {
+        min_date: Some(cutoff_date.to_string()),
+        min_time: cutoff_time.map(|t| t.to_string()),
+        status_prefix: None, // Capture ALL status codes (200, 301, 302, 400, 500) in the customer's journey!
+        required_substrings: Vec::new(),
+        any_substrings: union_needles,
+    };
+
+    let mut candidate_rows: Vec<FleetErrorRow> = Vec::new();
+    for (srv, items, joined_pattern, input_fmt) in server_sources {
+        let engine = LogEngine::with_options(threads, verbose);
+        if engine
+            .register_source_items_filtered(
+                "logs",
+                items.clone(),
+                *input_fmt,
+                None,
+                None,
+                Some(joined_pattern),
+                Some(&journey_pre_filter),
+            )
+            .await
+            .is_ok()
+        {
+            let cols = engine.table_columns("logs").await;
+            let sql = build_multi_format_error_sql(&cols, "*", cutoff_date, cutoff_time);
+            if let Ok(batches) = engine.query(&sql).await {
+                let rows = extract_fleet_rows(&batches, &srv.name, &srv.ip);
+                candidate_rows.extend(rows);
+            }
+        }
+    }
+
+    // Build a fast lookup set of trigger row signatures (`server|date|time|uri_stem|status|log_row`)
+    let trigger_sigs: HashSet<String> = trigger_rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                r.server_name, r.date, r.time, r.uri_stem, r.status, r.log_row
+            )
+        })
+        .collect();
+
+    let window_secs = trace_window_mins.max(1) * 60;
+    let mut all_journey_csv_rows: Vec<FleetJourneyCsvRow> = Vec::new();
+
+    for (j_idx, actor) in actors.iter().enumerate() {
+        let journey_id = j_idx + 1;
+        // Find all candidate rows belonging to this actor
+        let mut matched_steps: Vec<(FleetErrorRow, String, Option<i64>, bool)> = Vec::new();
+        let mut trigger_timestamps: Vec<i64> = Vec::new();
+
+        for r in &candidate_rows {
+            if let Some(reason) = actor.matches_row(r, explicit_trace_id) {
+                let sig = format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    r.server_name, r.date, r.time, r.uri_stem, r.status, r.log_row
+                );
+                let is_trig = trigger_sigs.contains(&sig);
+                let ts = parse_row_epoch_secs(&r.date, &r.time);
+                if is_trig {
+                    if let Some(t) = ts {
+                        trigger_timestamps.push(t);
+                    }
+                }
+                matched_steps.push((r.clone(), reason, ts, is_trig));
+            }
+        }
+
+        // Filter steps to within +/- trace_window_mins of at least one trigger timestamp (unless explicit_trace_id is used)
+        if explicit_trace_id.is_none() && !trigger_timestamps.is_empty() {
+            matched_steps.retain(|(_, _, ts_opt, is_trig)| {
+                if *is_trig {
+                    return true;
+                }
+                match ts_opt {
+                    Some(t) => trigger_timestamps
+                        .iter()
+                        .any(|trig_t| (*t - *trig_t).abs() <= window_secs),
+                    None => true,
+                }
+            });
+        }
+
+        // Sort chronologically across all servers by (date, time, log_row)
+        matched_steps.sort_by(|a, b| {
+            a.0.date
+                .cmp(&b.0.date)
+                .then_with(|| a.0.time.cmp(&b.0.time))
+                .then_with(|| {
+                    a.0.log_row
+                        .parse::<usize>()
+                        .unwrap_or(0)
+                        .cmp(&b.0.log_row.parse::<usize>().unwrap_or(0))
+                })
+        });
+
+        // Deduplicate identical log rows if any
+        matched_steps.dedup_by(|a, b| {
+            a.0.server_name == b.0.server_name
+                && a.0.date == b.0.date
+                && a.0.time == b.0.time
+                && a.0.log_file == b.0.log_file
+                && a.0.log_row == b.0.log_row
+        });
+
+        if matched_steps.is_empty() {
+            continue;
+        }
+
+        let unique_servers: HashSet<&str> = matched_steps
+            .iter()
+            .map(|s| s.0.server_name.as_str())
+            .collect();
+        let first_ts = matched_steps.first().and_then(|s| s.2);
+
+        println!(
+            "\n  {SYM_BULLET} JOURNEY #{} | Actor: {} ({}) | Steps: {} across {} server(s)",
+            journey_id,
+            actor.actor_label,
+            actor.matched_by,
+            matched_steps.len(),
+            unique_servers.len()
+        );
+        println!(
+            "    {:>4}  {:19}  {:>7}  {:14}  {:6}  {:6}  {:42}  {}",
+            "Step", "Date & Time (UTC)", "Delta", "Server", "Method", "Status", "URI + Query", "Evidence / Role"
+        );
+        println!(
+            "    ----  -------------------  -------  --------------  ------  ------  ------------------------------------------  ------------------------------"
+        );
+
+        let mut prev_server = String::new();
+        let mut prev_was_redirect = false;
+
+        for (s_idx, (row, match_reason, ts_opt, is_trig)) in matched_steps.iter().enumerate() {
+            let step_num = s_idx + 1;
+            let delta_str = match (first_ts, ts_opt) {
+                (Some(t0), Some(t)) => format!("+{:.0}s", (*t - t0).max(0) as f64),
+                _ => "+0s".to_string(),
+            };
+            let server_hop = if !prev_server.is_empty() && prev_server != row.server_name {
+                format!("{}->{}", prev_server, row.server_name)
+            } else {
+                String::new()
+            };
+            prev_server = row.server_name.clone();
+
+            let is_30x = matches!(row.status.as_str(), "301" | "302" | "303" | "307" | "308");
+            // Infer redirect target either from `sc(Location)` or from the immediate next step in the user's journey!
+            let inferred_redirect_target = if !row.redirect_location.is_empty() {
+                row.redirect_location.clone()
+            } else if is_30x {
+                matched_steps
+                    .get(s_idx + 1)
+                    .map(|next| {
+                        if next.0.uri_query.is_empty() {
+                            format!("{} (on {})", next.0.uri_stem, next.0.server_name)
+                        } else {
+                            format!(
+                                "{}?{} (on {})",
+                                next.0.uri_stem, next.0.uri_query, next.0.server_name
+                            )
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let step_role = if *is_trig && is_30x {
+                "TRIGGER_302_REDIRECT"
+            } else if *is_trig {
+                "TRIGGER_EVENT"
+            } else if prev_was_redirect {
+                "REDIRECT_LANDING"
+            } else if step_num == 1 {
+                "ENTRY"
+            } else {
+                "STEP"
+            };
+            prev_was_redirect = is_30x;
+
+            let full_uri = if row.uri_query.is_empty() || row.uri_query == "-" {
+                row.uri_stem.clone()
+            } else {
+                format!("{}?{}", row.uri_stem, row.uri_query)
+            };
+            let uri_disp = if full_uri.len() > 42 {
+                format!("{}...", &full_uri[..39])
+            } else {
+                full_uri.clone()
+            };
+
+            let mut note_parts = vec![step_role.to_string()];
+            if !inferred_redirect_target.is_empty() {
+                note_parts.push(format!("-> To: {}", inferred_redirect_target));
+            }
+            if !server_hop.is_empty() {
+                note_parts.push(format!("[Hop: {}]", server_hop));
+            }
+            if step_num == 1 && !row.referer.is_empty() && row.referer != "-" {
+                note_parts.push(format!("Ref: {}", row.referer));
+            }
+
+            println!(
+                "    {:>4}  {:10} {:8}  {:>7}  {:14}  {:6}  {:6}  {:42}  {}",
+                step_num,
+                row.date,
+                row.time,
+                delta_str,
+                row.server_name,
+                row.method,
+                row.status,
+                uri_disp,
+                note_parts.join(" | ")
+            );
+
+            all_journey_csv_rows.push(FleetJourneyCsvRow {
+                journey_id,
+                actor_identity: actor.actor_label.clone(),
+                matched_by: match_reason.clone(),
+                step_number: step_num,
+                step_role: step_role.to_string(),
+                delta_seconds: delta_str,
+                server_hop,
+                server_name: row.server_name.clone(),
+                server_ip: row.server_ip.clone(),
+                date: row.date.clone(),
+                time: row.time.clone(),
+                client_ip: row.client_ip.clone(),
+                forwarded_ip: row.forwarded_ip.clone(),
+                method: row.method.clone(),
+                status: row.status.clone(),
+                sub_status: row.sub_status.clone(),
+                time_taken_ms: row.time_taken_ms.clone(),
+                uri_stem: row.uri_stem.clone(),
+                uri_query: row.uri_query.clone(),
+                redirect_target: inferred_redirect_target,
+                referer: row.referer.clone(),
+                user_agent: row.user_agent.clone(),
+                log_file: row.log_file.clone(),
+                log_row: row.log_row.clone(),
+            });
+        }
+    }
+
+    let safe_prefix: String = report_prefix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | '.'))
+        .collect();
+    let safe_prefix = if safe_prefix.is_empty() || safe_prefix.contains("..") {
+        "IIS-Errors"
+    } else {
+        &safe_prefix
+    };
+    let journey_csv = PathBuf::from(output_dir).join(format!(
+        "{}-Journeys-{}.csv",
+        safe_prefix, run_stamp
+    ));
+    {
+        let mut wtr = csv::Writer::from_path(&journey_csv)?;
+        for jrow in &all_journey_csv_rows {
+            wtr.serialize(jrow)?;
+        }
+        wtr.flush()?;
+    }
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!(
+        " {SYM_DONE} Journey Reconstruction Complete: {} total step(s) across {} customer journey(s) in {:.2}s",
+        format_int_commas(all_journey_csv_rows.len()),
+        actors.len(),
+        trace_start.elapsed().as_secs_f64()
+    );
+    println!(
+        " {SYM_FILE} Journeys CSV      : {}",
+        journey_csv.to_string_lossy()
+    );
+    println!("================================================================================");
+
+    Ok(())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lpr"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2021"
 authors = ["Sunil Warrier"]
 license = "MIT OR Unlicense"

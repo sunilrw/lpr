@@ -136,8 +136,8 @@ struct Cli {
     #[arg(long = "max-width", default_value_t = 80)]
     max_width: usize,
 
-    /// [Linux grep / ripgrep] Filter rows matching pattern across all columns (`-g` / `-E` / `--grep`)
-    #[arg(short = 'g', short_alias = 'E', long = "grep", value_name = "PATTERN")]
+    /// [Linux grep / ripgrep] Fast raw-byte filter matching substring/pattern across log lines (`-g` / `-E` / `--grep` / `--contains`)
+    #[arg(short = 'g', short_alias = 'E', long = "grep", alias = "contains", global = true, value_name = "PATTERN")]
     grep: Option<String>,
 
     /// [Linux grep -v] Invert match when used with `-g` / `--grep` (exclude matching rows)
@@ -378,13 +378,39 @@ enum Commands {
         #[arg(short = 'f', long = "local-path", value_name = "PATH_OR_ZIP")]
         local_path: Option<String>,
 
-        /// HTTP status prefix to scan for (default "5" for 500-599 errors; use "4" for 4xx; ignored when --sql is given)
-        #[arg(long = "status-prefix")]
+        /// HTTP status prefix or exact code to scan for (default "5" for 500-599 errors; use "302" for 302 redirects or "4" for 4xx)
+        #[arg(long = "status-prefix", alias = "status")]
         status_prefix: Option<String>,
 
         /// Run an arbitrary LPR SQL query on every server instead of the built-in error scan (queries the `logs` table)
         #[arg(long = "sql", value_name = "SQL_QUERY")]
         sql: Option<String>,
+
+        /// Deterministically learn & save session/cookie/query/IP intelligence from server logs into lpr.config.json (no AI)
+        #[arg(long = "learn", alias = "learn-intelligence")]
+        learn: bool,
+
+        /// Reconstruct full chronological cross-server user journeys for all customers matching the scan (e.g. failed payment, 302, or 500)
+        #[arg(long = "trace", alias = "trace-journeys")]
+        trace: bool,
+
+        /// Reconstruct the full cross-server user journey for a specific Customer ID, Session ID, Order ID, Cookie value, Clear IP, or X-Forwarded-For IP
+        #[arg(
+            long = "trace-id",
+            alias = "journey",
+            alias = "customer",
+            alias = "trace-ip",
+            value_name = "ID_COOKIE_OR_IP"
+        )]
+        trace_id: Option<String>,
+
+        /// Minutes before and after a trigger event to include when reconstructing cross-server user journeys (default: 15)
+        #[arg(long = "trace-window-mins", default_value_t = 15, value_name = "MINUTES")]
+        trace_window_mins: i64,
+
+        /// Maximum number of distinct customer journeys to trace in cohort mode (default: 25)
+        #[arg(long = "max-journeys", default_value_t = 25, value_name = "N")]
+        max_journeys: usize,
     },
 
     /// Manage saved configuration profiles in lpr.config.json (list, show, save, set-default)
@@ -1048,6 +1074,11 @@ async fn main() -> Result<()> {
             local_path,
             status_prefix,
             sql,
+            learn,
+            trace,
+            trace_id,
+            trace_window_mins,
+            max_journeys,
         }) => {
             let cfg = fleet::FleetScanConfig {
                 cfg_file_path: cli.cfg_file.clone(),
@@ -1057,6 +1088,11 @@ async fn main() -> Result<()> {
                 days,
                 hours,
                 latest_only: latest,
+                learn_intelligence: learn,
+                trace_journeys: trace,
+                trace_id,
+                trace_window_mins,
+                max_journeys,
                 site_name: site,
                 report_prefix,
                 servers_csv: servers,
@@ -1080,6 +1116,7 @@ async fn main() -> Result<()> {
                 server_numbers,
                 local_path,
                 status_prefix,
+                contains_pattern: cli.grep.clone(),
                 custom_sql: sql,
                 threads: cli.threads,
                 verbose: cli.verbose,
@@ -1316,13 +1353,36 @@ async fn main() -> Result<()> {
         None
     };
 
+    let mut cli_pre_filter = if cli.joins.is_empty() && !cli.stats {
+        parsers::extract_sql_pre_filter(&rewritten_sql)
+    } else {
+        parsers::ScanPreFilter::default()
+    };
+    if !cli.invert_match && !cli.stats {
+        if let Some(ref g) = cli.grep {
+            let trimmed = g.trim();
+            if !trimmed.is_empty() && trimmed.is_ascii() {
+                cli_pre_filter.required_substrings.push(trimmed.to_string());
+            }
+        }
+    }
+    let pre_filter_opt = if cli_pre_filter.status_prefix.is_some()
+        || !cli_pre_filter.required_substrings.is_empty()
+        || !cli_pre_filter.any_substrings.is_empty()
+    {
+        Some(&cli_pre_filter)
+    } else {
+        None
+    };
+
     let detected_fmt = engine
-        .register_source_with_checkpoint(
+        .register_source_with_checkpoint_filtered(
             "logs",
             file_pattern,
             cli.input_format,
             cli.regex_pattern.as_deref(),
             ckpt_opt,
+            pre_filter_opt,
         )
         .await?;
     let parse_elapsed = parse_start.elapsed();

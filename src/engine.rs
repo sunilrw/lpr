@@ -28,6 +28,9 @@ static BRACKET_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| {
 static TOP_N_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\bSELECT\s+TOP\s+(\d+)\b"#).unwrap()
 });
+static LOWER_UPPER_LIKE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(?:LOWER|UPPER)\s*\(\s*([a-zA-Z0-9_.]+)\s*\)\s*(NOT\s+)?LIKE\s*('[^']*')"#).unwrap()
+});
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntentSuggestion {
@@ -181,7 +184,16 @@ pub fn normalize_logparser_sql(sql: &str, known_columns: &[String]) -> String {
     }
     w3c_candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-    replace_outside_single_quotes(&working, &w3c_candidates)
+    let replaced = replace_outside_single_quotes(&working, &w3c_candidates);
+    // 4. Rewrite LOWER(col) LIKE 'pat' / UPPER(col) LIKE 'pat' -> col ILIKE 'pat' to avoid allocating lowercase StringArrays
+    LOWER_UPPER_LIKE_RE
+        .replace_all(&replaced, |caps: &regex::Captures| {
+            let col = &caps[1];
+            let not_kw = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let pat = &caps[3];
+            format!("{} {}ILIKE {}", col, not_kw, pat)
+        })
+        .into_owned()
 }
 
 pub fn build_universal_search_predicate(
@@ -305,13 +317,42 @@ impl LogEngine {
         custom_regex: Option<&str>,
         ckpt: Option<&mut CheckpointStore>,
     ) -> Result<InputFormat> {
+        self.register_source_with_checkpoint_filtered(
+            table_name,
+            path_pattern,
+            format,
+            custom_regex,
+            ckpt,
+            None,
+        )
+        .await
+    }
+
+    pub async fn register_source_with_checkpoint_filtered(
+        &self,
+        table_name: &str,
+        path_pattern: &str,
+        format: InputFormat,
+        custom_regex: Option<&str>,
+        ckpt: Option<&mut CheckpointStore>,
+        pre_filter: Option<&ScanPreFilter>,
+    ) -> Result<InputFormat> {
         let items = resolve_source_items(path_pattern)?;
-        self.register_source_items(table_name, items, format, custom_regex, ckpt, Some(path_pattern))
-            .await
+        self.register_source_items_filtered(
+            table_name,
+            items,
+            format,
+            custom_regex,
+            ckpt,
+            Some(path_pattern),
+            pre_filter,
+        )
+        .await
     }
 
     /// Register a pre-resolved (and optionally pre-filtered) set of source items.
     /// Used by fleet scans to skip out-of-window files before parsing.
+    #[allow(dead_code)]
     pub async fn register_source_items(
         &self,
         table_name: &str,

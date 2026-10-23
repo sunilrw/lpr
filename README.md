@@ -1,4 +1,4 @@
-# 🛡️ LPR (Log Parser Rust) v1.4.2
+# 🛡️ LPR (Log Parser Rust) v1.4.3
 
 **Modern Multi-Threaded Rust SQL Log Engine, Fleet Error Scanner & Automated Security Auditor**  
 *Powered by Apache Arrow 53, DataFusion 42 & Rayon Parallel Engine*  
@@ -108,21 +108,56 @@ lpr.exe history 500
 lpr.exe history --clear
 ```
 
+### E. Fast Raw-Byte Substring Pushdown & Robocopy/LogParser Summary Table
+`lpr fleet` automatically pushes SQL `LIKE` / `ILIKE` substrings and `sc_status` filters down to the raw byte scanner before UTF-8 decoding or Arrow allocation, and prints per-server timing (`files`, `lines`, `elapsed seconds`) plus a **Robocopy / Log Parser 2.2 style summary table** at the end:
+
+```cmd
+:: Fast status + URL substring scan across all servers (last 12 hours) without writing SQL:
+lpr.exe fleet --profile AcmeStore --hours 12 --status 302 -g "/partner-api/" --report-prefix Acme-Partner-302
+
+:: Or using custom SQL (automatically extracts raw-byte needles & rewrites LOWER(...) LIKE to ILIKE):
+lpr.exe fleet --profile AcmeStore --hours 12 --report-prefix Acme-Partner-302 --sql "SELECT * FROM logs WHERE LOWER(cs_uri_stem) LIKE '%/partner-api/%' AND sc_status = '302'"
+```
+
+### F. Deterministic Session Intelligence (`--learn`) & Cross-Server User Journey Reconstruction (`--trace`)
+When requests are load-balanced across multiple servers **without sticky sessions**, `lpr` can reconstruct the full chronological journey of a customer across all servers using **100% deterministic math (zero AI)**:
+
+1. **Learn & Save Session Intelligence (`--learn`)**:
+   Scans sample logs to discover W3C columns, high-cardinality identity/session cookies (`ASP.NET_SessionId`, `shop_session`, `customerId`, `visitorId`, `cartId`), query-string correlators (`orderId`, `paymentId`, `cartId`, `sessionId`), `X-Forwarded-For` / `c-ip` columns, and `sc(Location)` redirect headers, saving them into `lpr.config.json`:
+   ```cmd
+   lpr.exe fleet --profile AcmeStore --learn
+   ```
+2. **Trace All Customers Who Hit an Error, Failed Payment, or Got a `302` Redirect (`--trace`)**:
+   Finds the trigger events first, extracts each affected customer's Session Cookie, Query ID, `X-Forwarded-For` IP, or Clear `c-ip`, and sweeps all servers (`±15 mins` default) to stitch each user's step-by-step cross-server timeline (including server hops and where `302` redirects landed):
+   ```cmd
+   :: Trace full cross-server journeys for all customers who failed payment:
+   lpr.exe fleet --profile AcmeStore --hours 12 -g "/checkout/pay" --status 5 --trace --report-prefix Acme-FailedPayment
+
+   :: Trace full cross-server journeys for all 302 redirects on /partner-api/ (shows REDIRECT_LANDING target):
+   lpr.exe fleet --profile AcmeStore --hours 12 --status 302 -g "/partner-api/" --trace --report-prefix Acme-Partner-302
+   ```
+3. **Trace a Specific Customer ID, Session ID, Order ID, Cookie, Clear IP, or `X-Forwarded-For` IP (`--customer` / `--trace-ip` / `--trace-id`)**:
+   Finds all requests (200, 302, 404, 500) for that identifier across all servers and automatically chains any Session Cookie or IP discovered on those hits to capture pre-login and post-login steps:
+   ```cmd
+   lpr.exe fleet --profile AcmeStore --hours 12 --customer "CUST-99482" --report-prefix Acme-Customer-99482
+   lpr.exe fleet --profile AcmeStore --hours 12 --trace-ip "198.51.100.42" --report-prefix Acme-IP-Journey
+   ```
+
 ---
 
 ## 🪟 2. Running on a Windows IIS Server (Single Folder / Local Logs)
 
-When you are inside an IIS log folder (such as `D:\emLogs\HOB2014\W3SVC4`) or querying `.log` / `.zip` files directly:
+When you are inside an IIS log folder (such as `D:\Logs\AcmeStore\W3SVC4`) or querying `.log` / `.zip` files directly:
 
 ### A. Find All 500-Level Errors in the Current Folder
 Both `lpr` `-f` syntax and classic **Microsoft Log Parser 2.2** syntax (`FROM *.log`) work identically:
 
 ```cmd
 :: Using -f flag:
-D:\emLogs\HOB2014\W3SVC4>d:\emScripts\lpr.exe -f "*.log" "SELECT * FROM logs WHERE sc_status LIKE '5%'"
+D:\Logs\AcmeStore\W3SVC4>C:\Tools\lpr.exe -f "*.log" "SELECT * FROM logs WHERE sc_status LIKE '5%'"
 
 :: Using Microsoft Log Parser 2.2 syntax (no -f needed, hyphenated column names work!):
-D:\emLogs\HOB2014\W3SVC4>d:\emScripts\lpr.exe -i:IISW3C "SELECT TOP 20 date, time, c-ip, cs-method, cs-uri-stem, sc-status, sc-substatus, [time-taken] FROM *.log WHERE sc-status LIKE '5%'"
+D:\Logs\AcmeStore\W3SVC4>C:\Tools\lpr.exe -i:IISW3C "SELECT TOP 20 date, time, c-ip, cs-method, cs-uri-stem, sc-status, sc-substatus, [time-taken] FROM *.log WHERE sc-status LIKE '5%'"
 ```
 
 **Sample Output (`samples/iis_u_ex.log`):**
@@ -139,7 +174,7 @@ D:\emLogs\HOB2014\W3SVC4>d:\emScripts\lpr.exe -i:IISW3C "SELECT TOP 20 date, tim
 
 ### B. Group Top Failing Endpoints & Average Response Latency
 ```cmd
-d:\emScripts\lpr.exe -f "*.log" "SELECT cs_uri_stem, sc_status, count(*) AS error_count, avg(time_taken::bigint) AS avg_latency_ms FROM logs WHERE sc_status LIKE '5%' GROUP BY cs_uri_stem, sc_status ORDER BY error_count DESC"
+C:\Tools\lpr.exe -f "*.log" "SELECT cs_uri_stem, sc_status, count(*) AS error_count, avg(time_taken::bigint) AS avg_latency_ms FROM logs WHERE sc_status LIKE '5%' GROUP BY cs_uri_stem, sc_status ORDER BY error_count DESC"
 ```
 **Output:**
 ```text
@@ -154,16 +189,16 @@ d:\emScripts\lpr.exe -f "*.log" "SELECT cs_uri_stem, sc_status, count(*) AS erro
 
 ### C. Breakdown by IIS Substatus & Win32 Error Description
 ```cmd
-d:\emScripts\lpr.exe -f "*.log" "SELECT sc_status, sc_substatus, sc_win32_status, win32_error_description(sc_win32_status) AS win32_meaning, count(*) AS hits FROM logs WHERE sc_status LIKE '5%' GROUP BY 1, 2, 3, 4"
+C:\Tools\lpr.exe -f "*.log" "SELECT sc_status, sc_substatus, sc_win32_status, win32_error_description(sc_win32_status) AS win32_meaning, count(*) AS hits FROM logs WHERE sc_status LIKE '5%' GROUP BY 1, 2, 3, 4"
 ```
 
 ### D. Export 500 Errors Directly to CSV
 ```cmd
 :: Using --out-file:
-d:\emScripts\lpr.exe -f "*.log" -o csv --out-file C:\temp\iis_500_errors.csv "SELECT * FROM logs WHERE sc_status LIKE '5%'"
+C:\Tools\lpr.exe -f "*.log" -o csv --out-file C:\temp\iis_500_errors.csv "SELECT * FROM logs WHERE sc_status LIKE '5%'"
 
 :: Or using Log Parser 2.2 INTO syntax:
-d:\emScripts\lpr.exe -i:IISW3C "SELECT * INTO C:\temp\iis_500_errors.csv FROM *.log WHERE sc-status LIKE '5%'"
+C:\Tools\lpr.exe -i:IISW3C "SELECT * INTO C:\temp\iis_500_errors.csv FROM *.log WHERE sc-status LIKE '5%'"
 ```
 
 ---
@@ -316,7 +351,7 @@ All sample files below are included in the [`samples/`](samples/) directory.
 ./target/release/lpr serve --bind 127.0.0.1:8080
 
 # Windows Server
-d:\emScripts\lpr.exe serve --bind 0.0.0.0:8080
+C:\Tools\lpr.exe serve --bind 0.0.0.0:8080
 ```
 Open **`http://localhost:8080`** for the dark-mode SOC console with visual File/Folder Browser, Context-Aware Intent Chips, Live SQL `Tab` Auto-Completion, and Security Audit tabs.
 

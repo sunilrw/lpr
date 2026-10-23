@@ -222,6 +222,281 @@ pub struct ScanPreFilter {
     pub min_date: Option<String>,
     pub min_time: Option<String>,
     pub status_prefix: Option<String>,
+    /// Case-insensitive ASCII substrings that MUST ALL appear in the raw log line.
+    pub required_substrings: Vec<String>,
+    /// Case-insensitive ASCII substrings where AT LEAST ONE must appear in the raw log line (if non-empty).
+    pub any_substrings: Vec<String>,
+}
+
+static SQL_JOIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bJOIN\b").unwrap());
+static SQL_WHERE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)\bWHERE\b\s+(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bHAVING\b|\bUNION\b|\bINTO\b|;|$)").unwrap()
+});
+static SQL_STATUS_EQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?i)\s*(?:[a-zA-Z0-9_]+\.)?\[?(?:sc_status|sc-status|status)\]?\s*(?:=\s*'(\d{1,3})'|I?LIKE\s*'(\d{1,3})%?')\s*$").unwrap()
+});
+static SQL_COL_LIKE_EQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?i)\s*(?:(?:LOWER|UPPER|TRIM)\s*\(\s*)?(?:[a-zA-Z0-9_]+\.)?\[?([a-zA-Z0-9_()-]+)\]?\s*\)?\s*(?:I?LIKE|=)\s*'([^']+)'\s*$").unwrap()
+});
+static SQL_NEGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bNOT\b|!=|<>|\bIS\s+NULL\b|\bCOALESCE\b").unwrap()
+});
+
+/// Extracts safe, zero-false-negative row-level pre-filter hints (`status_prefix`, `required_substrings`, `any_substrings`)
+/// from a SQL query's `WHERE` clause so lines that cannot possibly match are skipped at the raw byte level
+/// BEFORE UTF-8 decoding, whitespace splitting, or Arrow StringBuilder allocation.
+pub fn extract_sql_pre_filter(sql: &str) -> ScanPreFilter {
+    let mut filter = ScanPreFilter::default();
+    if SQL_JOIN_RE.is_match(sql) {
+        return filter;
+    }
+    let Some(caps) = SQL_WHERE_RE.captures(sql) else {
+        return filter;
+    };
+    let where_body = caps[1].trim();
+    if where_body.is_empty() {
+        return filter;
+    }
+
+    for raw_conj in split_top_level_sql_keyword(where_body, "AND") {
+        let conj = strip_outer_sql_parens(raw_conj.trim());
+        if conj.is_empty() {
+            continue;
+        }
+        let or_branches = split_top_level_sql_keyword(conj, "OR");
+        if or_branches.len() == 1 {
+            if SQL_NEGATION_RE.is_match(conj) {
+                continue;
+            }
+            if let Some(sc) = SQL_STATUS_EQ_RE.captures(conj) {
+                if let Some(m) = sc.get(1).or_else(|| sc.get(2)) {
+                    filter.status_prefix = Some(m.as_str().to_string());
+                }
+            }
+            for seg in extract_positive_like_substrings(conj) {
+                let lower = seg.to_ascii_lowercase();
+                if !filter.required_substrings.contains(&lower) {
+                    filter.required_substrings.push(lower);
+                }
+            }
+        } else {
+            // Multiple OR branches: if EVERY branch is a positive LIKE/= predicate on a data column,
+            // then at least one branch's required substring must appear in the raw line!
+            let mut branch_needles: Vec<String> = Vec::new();
+            let mut all_valid = true;
+            for br in or_branches {
+                let b_clean = strip_outer_sql_parens(br.trim());
+                if SQL_NEGATION_RE.is_match(b_clean) {
+                    all_valid = false;
+                    break;
+                }
+                let mut segs = extract_positive_like_substrings(b_clean);
+                // Pick the longest literal segment for this OR branch
+                segs.sort_by(|a, b| b.len().cmp(&a.len()));
+                if let Some(best) = segs.into_iter().next() {
+                    let lower = best.to_ascii_lowercase();
+                    if !branch_needles.contains(&lower) {
+                        branch_needles.push(lower);
+                    }
+                } else {
+                    all_valid = false;
+                    break;
+                }
+            }
+            if all_valid && !branch_needles.is_empty() {
+                if branch_needles.len() == 1 {
+                    let only = branch_needles.remove(0);
+                    if !filter.required_substrings.contains(&only) {
+                        filter.required_substrings.push(only);
+                    }
+                } else if filter.any_substrings.is_empty() {
+                    filter.any_substrings = branch_needles;
+                }
+            }
+        }
+    }
+
+    filter
+}
+
+fn extract_positive_like_substrings(expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(caps) = SQL_COL_LIKE_EQ_RE.captures(expr) {
+        let col = caps[1].to_ascii_lowercase();
+        if matches!(
+            col.as_str(),
+            "log_filename" | "logfilename" | "log_row" | "logrow" | "file" | "line_number" | "index"
+        ) {
+            return out;
+        }
+        let pat = &caps[2];
+        for seg in pat.split(['%', '_']) {
+            if seg.len() >= 2 && seg.is_ascii() {
+                out.push(seg.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn strip_outer_sql_parens(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim();
+        if trimmed.starts_with('(') && trimmed.ends_with(')') {
+            let bytes = trimmed.as_bytes();
+            let mut depth = 0i32;
+            let mut in_single = false;
+            let mut wraps_all = true;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'\'' {
+                    in_single = !in_single;
+                } else if !in_single {
+                    if b == b'(' {
+                        depth += 1;
+                    } else if b == b')' {
+                        depth -= 1;
+                        if depth == 0 && i + 1 < bytes.len() {
+                            wraps_all = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if wraps_all && depth == 0 {
+                s = &trimmed[1..trimmed.len() - 1];
+                continue;
+            }
+        }
+        return trimmed;
+    }
+}
+
+fn split_top_level_sql_keyword<'a>(s: &'a str, kw: &str) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let bytes = s.as_bytes();
+    let kw_bytes = kw.as_bytes();
+    let kw_len = kw_bytes.len();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut last_start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth = (depth - 1).max(0);
+            } else if depth == 0 && i + kw_len <= bytes.len() {
+                let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')';
+                let next_ok = i + kw_len == bytes.len()
+                    || bytes[i + kw_len].is_ascii_whitespace()
+                    || bytes[i + kw_len] == b'(';
+                if prev_ok && next_ok && bytes[i..i + kw_len].eq_ignore_ascii_case(kw_bytes) {
+                    parts.push(&s[last_start..i]);
+                    i += kw_len;
+                    last_start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[last_start..]);
+    parts
+}
+
+#[inline(always)]
+pub fn contains_ascii_ci_prelowered(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    let n_len = needle_lower.len();
+    if n_len == 0 {
+        return true;
+    }
+    let h_len = haystack.len();
+    if h_len < n_len {
+        return false;
+    }
+    let first_lo = needle_lower[0];
+    let first_hi = first_lo.to_ascii_uppercase();
+    let max_i = h_len - n_len;
+
+    if n_len == 1 {
+        return haystack.iter().any(|&b| b == first_lo || b == first_hi);
+    }
+
+    let second_lo = needle_lower[1];
+    let second_hi = second_lo.to_ascii_uppercase();
+    let rest = &needle_lower[2..];
+
+    let mut i = 0;
+    if first_lo == first_hi {
+        while i <= max_i {
+            if let Some(rel) = haystack[i..=max_i].iter().position(|&b| b == first_lo) {
+                i += rel;
+                let b1 = haystack[i + 1];
+                if (b1 == second_lo || b1 == second_hi)
+                    && eq_ascii_ci_lowered(&haystack[i + 2..i + n_len], rest)
+                {
+                    return true;
+                }
+                i += 1;
+            } else {
+                return false;
+            }
+        }
+        false
+    } else {
+        while i <= max_i {
+            let b0 = haystack[i];
+            if b0 == first_lo || b0 == first_hi {
+                let b1 = haystack[i + 1];
+                if (b1 == second_lo || b1 == second_hi)
+                    && eq_ascii_ci_lowered(&haystack[i + 2..i + n_len], rest)
+                {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+#[inline(always)]
+fn eq_ascii_ci_lowered(slice: &[u8], needle_lower: &[u8]) -> bool {
+    for idx in 0..needle_lower.len() {
+        if slice[idx].to_ascii_lowercase() != needle_lower[idx] {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline(always)]
+pub fn matches_raw_line_needles(
+    slice: &[u8],
+    req_needles_lower: &[Vec<u8>],
+    any_needles_lower: &[Vec<u8>],
+) -> bool {
+    for req in req_needles_lower {
+        if !contains_ascii_ci_prelowered(slice, req) {
+            return false;
+        }
+    }
+    if !any_needles_lower.is_empty()
+        && !any_needles_lower
+            .iter()
+            .any(|n| contains_ascii_ci_prelowered(slice, n))
+    {
+        return false;
+    }
+    true
 }
 
 static RE_IIS_DATE: LazyLock<Regex> =
@@ -743,6 +1018,13 @@ pub fn detect_format_item(item: &LogSourceItem) -> InputFormat {
         || clean.starts_with("smtp")
         || full_disp.contains("w3svc")
         || full_disp.contains("smtpsvc");
+    if clean.starts_with("u_ex")
+        || clean.starts_with("u_in")
+        || full_disp.contains("w3svc")
+        || full_disp.contains("smtpsvc")
+    {
+        return InputFormat::W3c;
+    }
 
     let mut none_ckpt = None;
     if let Ok(sample_lines) = read_decoded_lines_from_item(item, &mut none_ckpt, Some(50)) {
@@ -902,6 +1184,23 @@ pub fn parse_w3c_items_parallel_filtered(
     let filter_min_date = pre_filter.and_then(|f| f.min_date.as_deref());
     let filter_min_time = pre_filter.and_then(|f| f.min_time.as_deref());
     let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
+    let req_needles_lower: Vec<Vec<u8>> = pre_filter
+        .map(|f| {
+            f.required_substrings
+                .iter()
+                .map(|s| s.to_ascii_lowercase().into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let any_needles_lower: Vec<Vec<u8>> = pre_filter
+        .map(|f| {
+            f.any_substrings
+                .iter()
+                .map(|s| s.to_ascii_lowercase().into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_raw_filter = !req_needles_lower.is_empty() || !any_needles_lower.is_empty();
 
     // Step 2: Process every file / ZIP entry in parallel via Rayon!
     let per_file_results: Vec<Result<(RecordBatch, FileParseSummary)>> = items
@@ -989,6 +1288,13 @@ pub fn parse_w3c_items_parallel_filtered(
                             }
                         }
                     }
+                    continue;
+                }
+
+                // Zero-allocation raw-byte substring pushdown BEFORE UTF-8 decoding or whitespace splitting!
+                if has_raw_filter
+                    && !matches_raw_line_needles(slice, &req_needles_lower, &any_needles_lower)
+                {
                     continue;
                 }
 
@@ -1141,10 +1447,36 @@ fn parse_w3c_single_item_utf16(
     let filter_min_date = pre_filter.and_then(|f| f.min_date.as_deref());
     let filter_min_time = pre_filter.and_then(|f| f.min_time.as_deref());
     let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
+    let req_needles_lower: Vec<Vec<u8>> = pre_filter
+        .map(|f| {
+            f.required_substrings
+                .iter()
+                .map(|s| s.to_ascii_lowercase().into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let any_needles_lower: Vec<Vec<u8>> = pre_filter
+        .map(|f| {
+            f.any_substrings
+                .iter()
+                .map(|s| s.to_ascii_lowercase().into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_raw_filter = !req_needles_lower.is_empty() || !any_needles_lower.is_empty();
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if has_raw_filter
+            && !matches_raw_line_needles(
+                trimmed.as_bytes(),
+                &req_needles_lower,
+                &any_needles_lower,
+            )
+        {
             continue;
         }
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -1534,6 +1866,23 @@ pub fn parse_regex_items_parallel_filtered(
         .collect();
     let schema = Arc::new(Schema::new(arrow_fields));
     let filter_status_prefix = pre_filter.and_then(|f| f.status_prefix.as_deref());
+    let req_needles_lower: Vec<Vec<u8>> = pre_filter
+        .map(|f| {
+            f.required_substrings
+                .iter()
+                .map(|s| s.to_ascii_lowercase().into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let any_needles_lower: Vec<Vec<u8>> = pre_filter
+        .map(|f| {
+            f.any_substrings
+                .iter()
+                .map(|s| s.to_ascii_lowercase().into_bytes())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_raw_filter = !req_needles_lower.is_empty() || !any_needles_lower.is_empty();
     let status_group_idx = group_names.iter().position(|g| {
         matches!(
             g.as_str(),
@@ -1555,6 +1904,15 @@ pub fn parse_regex_items_parallel_filtered(
             let mut row_count = 0;
 
             for (line_idx, line) in lines.iter().enumerate() {
+                if has_raw_filter
+                    && !matches_raw_line_needles(
+                        line.as_bytes(),
+                        &req_needles_lower,
+                        &any_needles_lower,
+                    )
+                {
+                    continue;
+                }
                 if let Some(caps) = re.captures(line) {
                     if let (Some(sp), Some(s_idx)) = (filter_status_prefix, status_group_idx) {
                         let st = caps
