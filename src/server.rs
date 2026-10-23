@@ -1,7 +1,7 @@
 use crate::sym::*;
 use crate::audit::evaluate_security_findings;
-use crate::engine::{extract_source_from_sql, LogEngine};
-use crate::parsers::InputFormat;
+use crate::engine::{extract_source_from_sql, format_helpful_error, LogEngine};
+use crate::parsers::{clean_windows_path, is_supported_log_or_data_file, InputFormat};
 use crate::sinks::batches_to_json_value;
 use axum::{
     extract::{Query, State},
@@ -51,6 +51,7 @@ pub struct BrowseResponse {
     pub current_dir: String,
     pub parent_dir: Option<String>,
     pub glob_all_logs: String,
+    pub glob_all_csvs: String,
     pub entries: Vec<FileEntry>,
 }
 
@@ -62,10 +63,53 @@ pub struct QueryResponse {
     pub data: serde_json::Value,
 }
 
+/// Discovers the best default log or CSV file in the current workspace if none was explicitly specified.
+pub fn discover_initial_source(explicit: Option<String>) -> Option<String> {
+    if let Some(s) = explicit {
+        let cleaned = clean_windows_path(&s);
+        if !cleaned.is_empty() && cleaned != "." {
+            return Some(cleaned);
+        }
+    }
+    if Path::new("samples/iis/u_extend01.log").is_file() {
+        return Some("samples/iis/u_extend01.log".to_string());
+    }
+    if Path::new("samples/nginx_access.log").is_file() {
+        return Some("samples/nginx_access.log".to_string());
+    }
+    // Look in `./output` first (where `lpr fleet` writes reports), then `.` for the most recently modified .log or .csv file
+    let mut candidates: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for dir_name in ["output", "."] {
+        if let Ok(rd) = std::fs::read_dir(dir_name) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_file() && is_supported_log_or_data_file(&p) {
+                    let ext = p
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if matches!(ext.as_str(), "log" | "csv" | "tsv" | "json" | "zip" | "gz" | "evtx" | "xlsx") {
+                        let mtime = entry
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        let clean = clean_windows_path(&p.to_string_lossy());
+                        candidates.push((mtime, clean));
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
 pub async fn run_http_server(bind_addr: &str, default_source: Option<String>) -> anyhow::Result<()> {
+    let resolved_default = discover_initial_source(default_source);
     let state = Arc::new(AppState {
         total_queries: AtomicU64::new(0),
-        default_source,
+        default_source: resolved_default,
     });
 
     let app = Router::new()
@@ -159,14 +203,17 @@ async fn handle_query(State(state): State<Arc<AppState>>, Json(req): Json<QueryR
         .or(extracted_path)
         .or_else(|| state.default_source.clone());
 
-    if let Some(path) = src {
+    let src_clean = src.as_deref().map(clean_windows_path);
+
+    if let Some(ref path) = src_clean {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             let fmt = parse_format_str(req.format.as_deref());
             if let Err(e) = engine.register_source("logs", trimmed, fmt, None).await {
+                let helpful = format_helpful_error(&e.to_string(), Some(trimmed), &[]);
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": e.to_string() })),
+                    Json(serde_json::json!({ "error": helpful })),
                 );
             }
         }
@@ -192,20 +239,25 @@ async fn handle_query(State(state): State<Arc<AppState>>, Json(req): Json<QueryR
                 ),
             )
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(e) => {
+            let helpful = format_helpful_error(&e.to_string(), src_clean.as_deref(), &columns);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": helpful })),
+            )
+        }
     }
 }
 
 async fn handle_audit(State(state): State<Arc<AppState>>, Json(req): Json<AuditRequest>) -> impl IntoResponse {
     let src = match req.source.or_else(|| state.default_source.clone()) {
-        Some(s) if !s.trim().is_empty() => s,
+        Some(s) if !s.trim().is_empty() => clean_windows_path(&s),
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Provide a file or glob path" })),
+                Json(serde_json::json!({
+                    "error": format_helpful_error("No file or glob path specified for Security Audit.", None, &[])
+                })),
             )
         }
     };
@@ -218,20 +270,25 @@ async fn handle_audit(State(state): State<Arc<AppState>>, Json(req): Json<AuditR
                 "findings": findings
             })),
         ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(e) => {
+            let helpful = format_helpful_error(&e.to_string(), Some(&src), &[]);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": helpful })),
+            )
+        }
     }
 }
 
 async fn handle_schema(State(state): State<Arc<AppState>>, Json(req): Json<AuditRequest>) -> impl IntoResponse {
     let src = match req.source.or_else(|| state.default_source.clone()) {
-        Some(s) if !s.trim().is_empty() => s,
+        Some(s) if !s.trim().is_empty() => clean_windows_path(&s),
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Provide a file or glob path" })),
+                Json(serde_json::json!({
+                    "error": format_helpful_error("Provide a file or glob path", None, &[])
+                })),
             )
         }
     };
@@ -239,15 +296,18 @@ async fn handle_schema(State(state): State<Arc<AppState>>, Json(req): Json<Audit
     let engine = LogEngine::new();
     match engine.inspect_schema_and_intents(src.trim(), fmt).await {
         Ok(discovery) => (StatusCode::OK, Json(serde_json::to_value(discovery).unwrap())),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(e) => {
+            let helpful = format_helpful_error(&e.to_string(), Some(&src), &[]);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": helpful })),
+            )
+        }
     }
 }
 
 async fn handle_browse(Json(req): Json<BrowseRequest>) -> impl IntoResponse {
-    let raw_target = req.path.unwrap_or_default();
+    let raw_target = clean_windows_path(&req.path.unwrap_or_default());
     let target_trimmed = raw_target.trim();
     let base_dir: PathBuf = if target_trimmed.is_empty() || target_trimmed == "." {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -271,10 +331,11 @@ async fn handle_browse(Json(req): Json<BrowseRequest>) -> impl IntoResponse {
     let canonical = std::fs::canonicalize(&base_dir).unwrap_or_else(|_| base_dir.clone());
     let parent_dir = canonical
         .parent()
-        .map(|p| p.to_string_lossy().to_string());
-    let current_str = canonical.to_string_lossy().to_string();
+        .map(|p| clean_windows_path(&p.to_string_lossy()));
+    let current_str = clean_windows_path(&canonical.to_string_lossy());
     let sep = std::path::MAIN_SEPARATOR;
     let glob_all_logs = format!("{}{}*.log", current_str.trim_end_matches(sep), sep);
+    let glob_all_csvs = format!("{}{}*.csv", current_str.trim_end_matches(sep), sep);
 
     let mut entries = Vec::new();
     if let Ok(read_dir) = std::fs::read_dir(&canonical) {
@@ -287,10 +348,10 @@ async fn handle_browse(Json(req): Json<BrowseRequest>) -> impl IntoResponse {
             let meta = entry.metadata().ok();
             let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
             let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            if is_dir || is_supported_log_file(&name) {
+            if is_dir || (is_supported_log_file(&name) && is_supported_log_or_data_file(&path)) {
                 entries.push(FileEntry {
                     name,
-                    path: path.to_string_lossy().to_string(),
+                    path: clean_windows_path(&path.to_string_lossy()),
                     is_dir,
                     size_bytes,
                 });
@@ -310,6 +371,7 @@ async fn handle_browse(Json(req): Json<BrowseRequest>) -> impl IntoResponse {
             current_dir: current_str,
             parent_dir,
             glob_all_logs,
+            glob_all_csvs,
             entries,
         })
         .unwrap()),

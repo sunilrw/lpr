@@ -158,6 +158,82 @@ static W3C_DATA_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+").unwrap()
 });
 
+/// Strips Windows extended-length path prefixes (`\\?\D:\...` -> `D:\...` and `\\?\UNC\server\share` -> `\\server\share`)
+/// returned by `std::fs::canonicalize` on Windows so `?` is never mistaken for a glob wildcard or URL query delimiter.
+pub fn clean_windows_path(s: &str) -> String {
+    let trimmed = s.trim().trim_matches(['\'', '"']);
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Returns true if a file in a directory scan is a supported log/data file (and not a script, binary, or internal config file).
+pub fn is_supported_log_or_data_file(path: &Path) -> bool {
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if fname.is_empty()
+        || fname.starts_with('.')
+        || matches!(
+            fname.as_str(),
+            "lpr.config.json" | "servers.csv" | "lpr_history.json" | "cargo.toml" | "cargo.lock"
+        )
+    {
+        return false;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "exe"
+            | "dll"
+            | "pdb"
+            | "ps1"
+            | "bat"
+            | "cmd"
+            | "sh"
+            | "msi"
+            | "sys"
+            | "bin"
+            | "o"
+            | "obj"
+            | "lib"
+            | "rlib"
+            | "rmeta"
+            | "d"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "ico"
+            | "svg"
+            | "pdf"
+            | "html"
+            | "htm"
+            | "css"
+            | "js"
+            | "ts"
+            | "rs"
+            | "cs"
+            | "py"
+            | "toml"
+            | "lock"
+            | "md"
+    ) {
+        return false;
+    }
+    true
+}
+
 pub fn resolve_paths(pattern: &str) -> Result<Vec<PathBuf>> {
     if is_stdin_path(pattern) {
         return Ok(vec![PathBuf::from("-")]);
@@ -174,28 +250,38 @@ pub fn resolve_paths(pattern: &str) -> Result<Vec<PathBuf>> {
         vec![pattern.trim().trim_matches(['\'', '"'])]
     };
 
-    for sub in sub_patterns {
+    for raw_sub in sub_patterns {
+        let sub = clean_windows_path(raw_sub);
+        if sub.is_empty() {
+            continue;
+        }
+        let direct_path = PathBuf::from(&sub);
+        // Fast path: if it is directly an existing file on disk, push it immediately without globbing!
+        if direct_path.is_file() {
+            paths.push(direct_path);
+            continue;
+        }
         if sub.contains('*') || sub.contains('?') {
-            if let Ok(entries) = glob::glob(sub) {
+            if let Ok(entries) = glob::glob(&sub) {
                 for entry in entries.flatten() {
                     if entry.is_file() {
-                        paths.push(entry);
+                        paths.push(PathBuf::from(clean_windows_path(&entry.to_string_lossy())));
                     }
                 }
             }
-        } else {
-            let p = PathBuf::from(sub);
-            if p.is_dir() {
-                collect_files_recursive(&p, &mut paths);
-            } else if p.exists() {
-                paths.push(p);
-            }
+        } else if direct_path.is_dir() {
+            collect_files_recursive(&direct_path, &mut paths);
+        } else if direct_path.exists() {
+            paths.push(direct_path);
         }
     }
     paths.sort();
     paths.dedup();
     if paths.is_empty() {
-        anyhow::bail!("No log files matched pattern: {}", pattern);
+        anyhow::bail!(
+            "No log or data files matched path: `{}`. Verify the file/folder path exists and contains supported files (.log, .csv, .tsv, .json, .zip, .gz, .evtx, .xlsx).",
+            clean_windows_path(pattern)
+        );
     }
     Ok(paths)
 }
@@ -205,13 +291,17 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in rd.flatten() {
             let ep = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if name.starts_with('.')
+                || name.eq_ignore_ascii_case("target")
+                || name.eq_ignore_ascii_case("node_modules")
+                || name.eq_ignore_ascii_case("dist")
+            {
                 continue;
             }
             if ep.is_dir() {
                 collect_files_recursive(&ep, out);
-            } else if ep.is_file() {
-                out.push(ep);
+            } else if ep.is_file() && is_supported_log_or_data_file(&ep) {
+                out.push(PathBuf::from(clean_windows_path(&ep.to_string_lossy())));
             }
         }
     }
@@ -2546,6 +2636,261 @@ fn build_string_batch(field_names: &[String], rows: &[Vec<String>]) -> Result<Re
         .map(|mut b| Arc::new(b.finish()) as ArrayRef)
         .collect();
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+pub fn parse_csv_items_parallel(
+    items: &[LogSourceItem],
+    delimiter: u8,
+    verbose: bool,
+) -> Result<(Vec<RecordBatch>, ParseStats)> {
+    let mut canonical_headers: Vec<String> = Vec::new();
+    for item in items {
+        let mut none_ckpt = None;
+        if let Ok(reader) = open_source_item_reader(item, &mut none_ckpt) {
+            let mut rdr = csv::ReaderBuilder::new()
+                .delimiter(delimiter)
+                .flexible(true)
+                .has_headers(true)
+                .from_reader(reader);
+            if let Ok(hdrs) = rdr.headers() {
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                for (idx, h) in hdrs.iter().enumerate() {
+                    let clean = h
+                        .trim_start_matches('\u{feff}')
+                        .trim()
+                        .replace(['-', ' '], "_");
+                    let base = if clean.is_empty() {
+                        format!("col_{}", idx + 1)
+                    } else {
+                        clean
+                    };
+                    let count = seen.entry(base.to_lowercase()).or_insert(0);
+                    *count += 1;
+                    let final_name = if *count > 1 {
+                        format!("{}_{}", base, *count)
+                    } else {
+                        base
+                    };
+                    canonical_headers.push(final_name);
+                }
+                if !canonical_headers.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    if canonical_headers.is_empty() {
+        canonical_headers.push("col_1".to_string());
+    }
+
+    let num_csv_cols = canonical_headers.len();
+    let has_log_filename = canonical_headers
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("log_filename"));
+    let has_log_row = canonical_headers
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("log_row"));
+
+    let mut schema_fields = canonical_headers.clone();
+    if !has_log_filename {
+        schema_fields.push("log_filename".to_string());
+    }
+    if !has_log_row {
+        schema_fields.push("log_row".to_string());
+    }
+    let total_cols = schema_fields.len();
+    let arrow_fields: Vec<Field> = schema_fields
+        .iter()
+        .map(|name| Field::new(name, DataType::Utf8, true))
+        .collect();
+    let schema = Arc::new(Schema::new(arrow_fields));
+
+    let per_file: Vec<Result<(RecordBatch, FileParseSummary)>> = items
+        .par_iter()
+        .map(|item| {
+            let start = std::time::Instant::now();
+            let short_name = item.short_filename();
+            let disp_name = item.display_name();
+            let bytes = item.size_bytes();
+
+            let reader = open_source_item_reader(item, &mut None)?;
+            let mut rdr = csv::ReaderBuilder::new()
+                .delimiter(delimiter)
+                .flexible(true)
+                .has_headers(true)
+                .from_reader(reader);
+
+            let mut builders: Vec<StringBuilder> = (0..total_cols)
+                .map(|_| StringBuilder::with_capacity(256, 4096))
+                .collect();
+
+            let mut record = csv::ByteRecord::new();
+            let mut row_count: usize = 0;
+
+            while rdr.read_byte_record(&mut record).unwrap_or(false) {
+                row_count += 1;
+                for c in 0..num_csv_cols {
+                    if let Some(val_bytes) = record.get(c) {
+                        let s = decode_bytes_resilient(val_bytes);
+                        if s.is_empty() {
+                            builders[c].append_null();
+                        } else {
+                            builders[c].append_value(&s);
+                        }
+                    } else {
+                        builders[c].append_null();
+                    }
+                }
+                let mut extra_idx = num_csv_cols;
+                if !has_log_filename {
+                    builders[extra_idx].append_value(&short_name);
+                    extra_idx += 1;
+                }
+                if !has_log_row {
+                    let row_str = (row_count + 1).to_string();
+                    builders[extra_idx].append_value(&row_str);
+                }
+            }
+
+            let arrays: Vec<ArrayRef> = builders
+                .into_iter()
+                .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+                .collect();
+            let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+            let elapsed_ms = start.elapsed().as_millis();
+            if verbose {
+                eprintln!(
+                    "  {SYM_OK} Parsed {:28} | {:>8} lines | {:>8} rows | {:>5} ms",
+                    disp_name,
+                    row_count + 1,
+                    row_count,
+                    elapsed_ms
+                );
+            }
+            Ok((
+                batch,
+                FileParseSummary {
+                    name: disp_name,
+                    lines: row_count + 1,
+                    rows: row_count,
+                    bytes,
+                    elapsed_ms,
+                },
+            ))
+        })
+        .collect();
+
+    let mut batches = Vec::new();
+    let mut stats = ParseStats::default();
+    for res in per_file {
+        let (b, s) = res?;
+        stats.files_processed += 1;
+        stats.total_lines += s.lines;
+        stats.total_rows += s.rows;
+        stats.total_bytes += s.bytes;
+        stats.file_summaries.push(s);
+        if b.num_rows() > 0 {
+            batches.push(b);
+        }
+    }
+    if batches.is_empty() {
+        let empty: Vec<ArrayRef> = (0..total_cols)
+            .map(|_| {
+                let mut b = StringBuilder::new();
+                Arc::new(b.finish()) as ArrayRef
+            })
+            .collect();
+        batches.push(RecordBatch::try_new(schema, empty)?);
+    }
+    Ok((batches, stats))
+}
+
+pub fn parse_parquet_items(
+    items: &[LogSourceItem],
+    verbose: bool,
+) -> Result<(Vec<RecordBatch>, ParseStats)> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let mut batches = Vec::new();
+    let mut stats = ParseStats::default();
+    let mut fallback_schema: Option<Arc<Schema>> = None;
+
+    for item in items {
+        let start = std::time::Instant::now();
+        let disp_name = item.display_name();
+        let bytes = item.size_bytes();
+        let mut item_rows = 0usize;
+
+        match item {
+            LogSourceItem::DiskFile(path) => {
+                let file = File::open(path)
+                    .with_context(|| format!("Failed to open Parquet file {:?}", path))?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+                if fallback_schema.is_none() {
+                    fallback_schema = Some(builder.schema().clone());
+                }
+                let reader = builder.build()?;
+                for b_res in reader {
+                    let b = b_res?;
+                    item_rows += b.num_rows();
+                    if b.num_rows() > 0 {
+                        batches.push(b);
+                    }
+                }
+            }
+            _ => {
+                let mut reader = open_source_item_reader(item, &mut None)?;
+                let mut buf = Vec::new();
+                reader.read_to_end(&mut buf)?;
+                let tmp_path = std::env::temp_dir().join(format!(
+                    "lpr_parquet_tmp_{}.parquet",
+                    std::process::id()
+                ));
+                std::fs::write(&tmp_path, &buf)?;
+                let file = File::open(&tmp_path)?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+                if fallback_schema.is_none() {
+                    fallback_schema = Some(builder.schema().clone());
+                }
+                let rdr = builder.build()?;
+                for b_res in rdr {
+                    let b = b_res?;
+                    item_rows += b.num_rows();
+                    if b.num_rows() > 0 {
+                        batches.push(b);
+                    }
+                }
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+        }
+
+        let elapsed_ms = start.elapsed().as_millis();
+        if verbose {
+            eprintln!(
+                "  {SYM_OK} Parsed {:28} | {:>8} rows | {:>5} ms",
+                disp_name, item_rows, elapsed_ms
+            );
+        }
+        stats.files_processed += 1;
+        stats.total_lines += item_rows;
+        stats.total_rows += item_rows;
+        stats.total_bytes += bytes;
+        stats.file_summaries.push(FileParseSummary {
+            name: disp_name,
+            lines: item_rows,
+            rows: item_rows,
+            bytes,
+            elapsed_ms,
+        });
+    }
+
+    if batches.is_empty() {
+        let schema = fallback_schema
+            .unwrap_or_else(|| Arc::new(Schema::new(vec![Field::new("col_1", DataType::Utf8, true)])));
+        batches.push(RecordBatch::new_empty(schema));
+    }
+
+    Ok((batches, stats))
 }
 
 pub fn get_format_regex(fmt: InputFormat) -> Option<&'static Regex> {

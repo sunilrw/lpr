@@ -128,7 +128,7 @@ bash tests/smoke_test.sh
 
 ## 5. Known Constraints / Next-Agent Notes
 
-1. **`samples_client_local/` is gitignored** — it holds real client logs (Footasylum 1 GB zip). Never publish it. Public `samples/` contains ONLY synthetic RFC-5737 IPs (198.51.100.x, 203.0.113.x, 192.0.2.x).
+1. **`samples_client_local/` is gitignored** — it holds private local test archives. Never publish it. Public `samples/` contains ONLY synthetic RFC-5737 IPs (198.51.100.x, 203.0.113.x, 192.0.2.x).
 2. **SSH fleet mode** shells out to system `ssh` (BatchMode — key/agent auth only, no password prompts). Windows fleet mode uses direct `\\server\d$` file access (works when run on Windows with share permissions).
 3. **Linux remote scanning is pull-based** (SSH + zcat). A push-based mode (run `lpr` binary on the host) can be added via a `--remote-exec` flag — not yet implemented.
 4. `geoip_scope` is a coarse PRIVATE/PUBLIC/TEST-NET classifier — wire in a real MaxMind/GeoLite2 binary lookup (`maxminddb` crate) if full country/ASN data is wanted.

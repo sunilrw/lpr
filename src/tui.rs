@@ -1,6 +1,10 @@
 use crate::sym::*;
-use crate::engine::{extract_source_from_sql, generate_intent_suggestions, IntentSuggestion, LogEngine};
-use crate::parsers::InputFormat;
+use crate::engine::{
+    extract_source_from_sql, format_helpful_error, generate_intent_suggestions, IntentSuggestion,
+    LogEngine,
+};
+use crate::parsers::{clean_windows_path, is_supported_log_or_data_file, InputFormat};
+use crate::server::discover_initial_source;
 use anyhow::Result;
 use arrow::util::display::array_value_to_string;
 use crossterm::{
@@ -13,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
     Terminal,
 };
 use std::io;
@@ -57,17 +61,31 @@ const STATIC_COMPLETIONS: &[&str] = &[
 
 pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
     let mut engine = LogEngine::new();
-    let mut active_source = initial_source.to_string();
+    let cleaned_init = clean_windows_path(initial_source);
+    let mut active_source = if cleaned_init == "." || Path::new(&cleaned_init).is_dir() {
+        discover_initial_source(None).unwrap_or(cleaned_init)
+    } else {
+        cleaned_init
+    };
     let mut active_format = format;
     let mut detected_fmt = InputFormat::Auto;
     let mut columns: Vec<String> = Vec::new();
     let mut suggestions: Vec<IntentSuggestion> = Vec::new();
+    let mut last_error: Option<String> = None;
 
     if Path::new(&active_source).is_file() || active_source.contains('*') {
-        if let Ok(fmt) = engine.register_source("logs", &active_source, active_format, None).await {
-            detected_fmt = fmt;
-            columns = engine.table_columns("logs").await;
-            suggestions = generate_intent_suggestions(detected_fmt, &columns);
+        match engine
+            .register_source("logs", &active_source, active_format, None)
+            .await
+        {
+            Ok(fmt) => {
+                detected_fmt = fmt;
+                columns = engine.table_columns("logs").await;
+                suggestions = generate_intent_suggestions(detected_fmt, &columns);
+            }
+            Err(e) => {
+                last_error = Some(format_helpful_error(&e.to_string(), Some(&active_source), &[]));
+            }
         }
     }
 
@@ -89,17 +107,36 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
     let mut headers: Vec<String> = Vec::new();
     let mut table_rows: Vec<Vec<String>> = Vec::new();
 
-    if let Ok(batches) = engine.query(&sql_input).await {
-        extract_grid(&batches, &mut headers, &mut table_rows);
+    if !columns.is_empty() {
+        match engine.query(&sql_input).await {
+            Ok(batches) => {
+                extract_grid(&batches, &mut headers, &mut table_rows);
+                last_error = None;
+            }
+            Err(e) => {
+                last_error = Some(format_helpful_error(
+                    &e.to_string(),
+                    Some(&active_source),
+                    &columns,
+                ));
+            }
+        }
+    } else if last_error.is_none() {
+        last_error = Some(format_helpful_error(
+            "table 'datafusion.public.logs' not found",
+            Some(&active_source),
+            &[],
+        ));
     }
 
-    let mut modal = if Path::new(&active_source).is_dir() {
+    let mut modal = if Path::new(&active_source).is_dir() || columns.is_empty() {
         TuiModal::FileBrowser
     } else {
         TuiModal::None
     };
 
     let mut intent_idx: usize = 0;
+    let mut help_scroll: u16 = 0;
     let mut current_dir: PathBuf = if Path::new(&active_source).is_dir() {
         PathBuf::from(&active_source)
     } else {
@@ -130,7 +167,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
 
             let top_bar = Paragraph::new(Line::from(vec![
                 Span::styled(
-                    format!(" {SYM_SHIELD} lpr Studio TUI v1.1.0 "),
+                    format!(" {SYM_SHIELD} lpr Studio TUI v{} ", env!("CARGO_PKG_VERSION")),
                     Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
@@ -165,37 +202,69 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                 );
             f.render_widget(query_box, chunks[1]);
 
-            let header_cells = headers.iter().map(|h| {
-                Cell::from(h.as_str())
-                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            });
-            let header = Row::new(header_cells).height(1).bottom_margin(1);
-            let rows = table_rows.iter().map(|r| {
-                Row::new(r.iter().map(|c| {
-                    let style = if c.starts_with("CRITICAL:") || c.starts_with("HIGH:") {
-                        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
-                    } else if c.starts_with("MEDIUM:") {
-                        Style::default().fg(Color::Yellow)
+            if let Some(ref err_detail) = last_error {
+                let mut err_lines = vec![
+                    Line::from(Span::styled(
+                        format!("{SYM_WARN}  DIAGNOSTIC & TROUBLESHOOTING GUIDE"),
+                        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                ];
+                for line in err_detail.lines() {
+                    let st = if line.starts_with("WHAT IS WRONG:")
+                        || line.starts_with("HOW TO SOLVE IT:")
+                        || line.starts_with("AVAILABLE COLUMNS")
+                    {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else if line.trim_start().starts_with('•') {
+                        Style::default().fg(Color::LightCyan)
                     } else {
                         Style::default().fg(Color::White)
                     };
-                    Cell::from(c.as_str()).style(style)
-                }))
-                .height(1)
-            });
-            let col_count = headers.len().max(1);
-            let widths: Vec<Constraint> = (0..col_count)
-                .map(|_| Constraint::Percentage((100 / col_count).max(5) as u16))
-                .collect();
+                    err_lines.push(Line::from(Span::styled(format!("  {}", line), st)));
+                }
+                let err_box = Paragraph::new(err_lines)
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .style(Style::default().fg(Color::LightRed))
+                            .title(" Diagnostic Details & Solution Steps (Press F3 to Browse Files or F1 for Help) "),
+                    );
+                f.render_widget(err_box, chunks[2]);
+            } else {
+                let header_cells = headers.iter().map(|h| {
+                    Cell::from(h.as_str())
+                        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                });
+                let header = Row::new(header_cells).height(1).bottom_margin(1);
+                let rows = table_rows.iter().map(|r| {
+                    Row::new(r.iter().map(|c| {
+                        let style = if c.starts_with("CRITICAL:") || c.starts_with("HIGH:") {
+                            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+                        } else if c.starts_with("MEDIUM:") {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        Cell::from(c.as_str()).style(style)
+                    }))
+                    .height(1)
+                });
+                let col_count = headers.len().max(1);
+                let widths: Vec<Constraint> = (0..col_count)
+                    .map(|_| Constraint::Percentage((100 / col_count).max(5) as u16))
+                    .collect();
 
-            let table = Table::new(rows, widths).header(header).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" Query Results ({} rows) ", table_rows.len())),
-            );
-            f.render_widget(table, chunks[2]);
+                let table = Table::new(rows, widths).header(header).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Query Results ({} rows) ", table_rows.len())),
+                );
+                f.render_widget(table, chunks[2]);
+            }
 
-            let status_bar = Paragraph::new(status_msg.as_str())
+            let status_bar = Paragraph::new(status_msg.lines().next().unwrap_or(&status_msg))
                 .style(Style::default().fg(Color::Yellow))
                 .block(Block::default().borders(Borders::ALL).title(" Status & Shortcuts "));
             f.render_widget(status_bar, chunks[3]);
@@ -203,24 +272,46 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
             match modal {
                 TuiModal::None => {}
                 TuiModal::Help => {
-                    let area = centered_rect(82, 82, f.area());
+                    let area = centered_rect(88, 86, f.area());
                     f.render_widget(Clear, area);
                     let help_text = vec![
                         Line::from(Span::styled(
-                            format!("{SYM_BOOKS} LPR TUI & SQL COMPLETE REFERENCE MANUAL"),
+                            format!("{SYM_BOOKS} LPR v{} COMPLETE TUI, CLI, FLEET & SQL REFERENCE MANUAL (Use Up/Down/PgUp/PgDn to scroll)", env!("CARGO_PKG_VERSION")),
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         )),
                         Line::from(""),
-                        Line::from("⌨️  KEYBOARD SHORTCUTS:"),
-                        Line::from("  • Enter       Execute current SQL query"),
-                        Line::from("  • Tab         Context-aware auto-completion (schema columns, SQL keywords, UDFs)"),
-                        Line::from("  • F1          Toggle this Full Help & UDF Reference Manual"),
-                        Line::from("  • F2          Open Context-Aware Intent Query Picker (tailored to active file)"),
-                        Line::from("  • F3          Open Interactive File & Directory Browser (select file or *.log)"),
-                        Line::from("  • Ctrl+U      Clear SQL query input"),
-                        Line::from("  • Esc         Close active modal or exit TUI"),
+                        Line::from(Span::styled("1. TUI KEYBOARD SHORTCUTS:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Enter         Execute current SQL query"),
+                        Line::from("  • Tab           Context-aware auto-completion (schema columns, SQL keywords, UDFs)"),
+                        Line::from("  • F1            Toggle this Full Help & Parameter Reference Manual"),
+                        Line::from("  • F2            Open Context-Aware Intent Query Picker (tailored to active file)"),
+                        Line::from("  • F3            Open Interactive File & Directory Browser (select file, *.log, or *.csv)"),
+                        Line::from("  • Ctrl+U        Clear SQL query input"),
+                        Line::from("  • Esc           Close active modal or exit TUI"),
                         Line::from(""),
-                        Line::from(format!("{SYM_SHIELD}  CYBERSECURITY & LOG PARSER 2.2 SQL UDFs:")),
+                        Line::from(Span::styled("2. MULTI-SERVER FLEET SCANNER & TIME WINDOWS (`lpr fleet`):", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Save server profile once:  lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path \"D:\\Logs\\AcmeStore\" -j 8"),
+                        Line::from("  • Scan last 12 hours:        lpr fleet --hours 12 --status 302 -g \"/partner-api/\""),
+                        Line::from("  • Scan today (1 day):        lpr fleet -d 1 --status 500"),
+                        Line::from("  • Scan newest active file:   lpr fleet --latest --status 5"),
+                        Line::from("  • Custom SQL across servers: lpr fleet -d 1 --sql \"SELECT date, time, cs_uri_stem, sc_status FROM logs WHERE cs_uri_stem LIKE '%/partner-api/%'\""),
+                        Line::from(""),
+                        Line::from(Span::styled("3. SESSION INTELLIGENCE & CROSS-SERVER USER JOURNEY RECONSTRUCTION (NO AI):", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Step 1 — Learn session cookies/query params/X-Forwarded-For from logs & save to lpr.config.json:"),
+                        Line::from("      lpr fleet --learn --latest"),
+                        Line::from("  • Step 2A — Trace full journey of a specific Customer ID, Session ID, Order ID, or Cookie:"),
+                        Line::from("      lpr fleet -d 1 --customer \"CUST-99481\""),
+                        Line::from("  • Step 2B — Trace full journey by Clear Client IP or X-Forwarded-For IP:"),
+                        Line::from("      lpr fleet -d 1 --trace-ip \"203.0.113.45\""),
+                        Line::from("  • Step 2C — Trace journeys of ALL customers who failed payment or hit 500/302 (`--trace`):"),
+                        Line::from("      lpr fleet --hours 12 --status 500 -g \"/checkout/payment\" --trace"),
+                        Line::from(""),
+                        Line::from(Span::styled("4. COMMAND HISTORY, PROFILES & LINUX CLI FLAGS:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Command History:           lpr history  |  lpr history -i (DOS Up/Down arrows)  |  lpr --rerun 5  |  lpr !5"),
+                        Line::from("  • Saved Profiles:            lpr config   |  lpr config --set-default ProdWeb"),
+                        Line::from("  • Linux grep + awk + stats:  lpr -f app.log -g \"500\" -F date,time,c_ip,cs_uri_stem,sc_status  |  lpr -f app.log --stats"),
+                        Line::from(""),
+                        Line::from(Span::styled("5. CYBERSECURITY & MICROSOFT LOG PARSER 2.2 SQL UDFs (23 FUNCTIONS):", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
                         Line::from("  • detect_threat(col)             Detects SQLi, XSS, LFI, RCE/Log4Shell, SSRF"),
                         Line::from("  • ip_in_cidr(ip, '10.0.0.0/8')   IPv4/IPv6 CIDR subnet containment"),
                         Line::from("  • shannon_entropy(col)           0.0-8.0 entropy score for base64/DGA anomalies"),
@@ -229,20 +320,22 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         Line::from("  • url_decode(col) / parse_ua(c)  URL percent-decode & User-Agent classification"),
                         Line::from("  • extract_token(s, idx, delim)   [LogParser 2.2] 0-based token split"),
                         Line::from("  • extract_extension(path)        [LogParser 2.2] Lowercase file extension (.aspx)"),
+                        Line::from("  • win32_error_description(code)  [LogParser 2.2] Translate sc_win32_status code"),
                         Line::from("  • to_timestamp(date, time)       [LogParser 2.2] Combine W3C date & time"),
                         Line::from("  • index_of(str, substr)          [LogParser 2.2] 0-based substring index"),
                         Line::from(""),
-                        Line::from(format!("{SYM_TIP} MICROSOFT LOG PARSER 2.2 COMPATIBILITY:")),
-                        Line::from("  • Query files directly in SQL:   SELECT * FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%'"),
-                        Line::from("  • Hyphenated & TOP N syntax:     SELECT TOP 10 cs-uri-stem, [time-taken] FROM logs"),
+                        Line::from(Span::styled("6. MICROSOFT LOG PARSER 2.2 SQL EXAMPLES:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        Line::from("  • Direct file in FROM:  SELECT * FROM 'D:\\Logs\\u_ex261016.log' WHERE sc-status LIKE '5%'"),
+                        Line::from("  • Export via INTO:      SELECT TOP 20 cs-uri-stem, COUNT(*) AS hits INTO top.csv FROM *.log GROUP BY 1 ORDER BY hits DESC"),
                     ];
                     let p = Paragraph::new(help_text)
+                        .scroll((help_scroll, 0))
                         .wrap(Wrap { trim: false })
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .style(Style::default().bg(Color::Black))
-                                .title(" Full Help Manual (Press Esc or F1 to close) "),
+                                .title(" Full Help Manual (Up/Down/PgUp/PgDn to Scroll | Esc or F1 to Close) "),
                         );
                     f.render_widget(p, area);
                 }
@@ -283,7 +376,7 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                     f.render_widget(list, area);
                 }
                 TuiModal::FileBrowser => {
-                    let area = centered_rect(75, 75, f.area());
+                    let area = centered_rect(78, 78, f.area());
                     f.render_widget(Clear, area);
                     let items: Vec<ListItem> = browser_items
                         .iter()
@@ -307,16 +400,18 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                             )))
                         })
                         .collect();
+                    let mut list_state = ListState::default();
+                    list_state.select(Some(browser_idx));
                     let list = List::new(items).block(
                         Block::default()
                             .borders(Borders::ALL)
                             .style(Style::default().bg(Color::Black))
                             .title(format!(
                                 " {SYM_DIR} File & Folder Browser: {} ({SYM_UP}/{SYM_DOWN}, Enter=Select, Esc=Close) ",
-                                current_dir.to_string_lossy()
+                                clean_windows_path(&current_dir.to_string_lossy())
                             )),
                     );
-                    f.render_widget(list, area);
+                    f.render_stateful_widget(list, area, &mut list_state);
                 }
             }
         })?;
@@ -326,6 +421,10 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                 match modal {
                     TuiModal::Help => match key.code {
                         KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => modal = TuiModal::None,
+                        KeyCode::Down => help_scroll = help_scroll.saturating_add(1),
+                        KeyCode::Up => help_scroll = help_scroll.saturating_sub(1),
+                        KeyCode::PageDown => help_scroll = help_scroll.saturating_add(10),
+                        KeyCode::PageUp => help_scroll = help_scroll.saturating_sub(10),
                         _ => {}
                     },
                     TuiModal::Intents => match key.code {
@@ -347,13 +446,22 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                 match engine.query(&sql_input).await {
                                     Ok(batches) => {
                                         extract_grid(&batches, &mut headers, &mut table_rows);
+                                        last_error = None;
                                         status_msg = format!(
                                             "Executed Intent `{}` -> {} rows",
                                             chosen.title,
                                             table_rows.len()
                                         );
                                     }
-                                    Err(e) => status_msg = format!("SQL Error: {}", e),
+                                    Err(e) => {
+                                        let helpful = format_helpful_error(
+                                            &e.to_string(),
+                                            Some(&active_source),
+                                            &columns,
+                                        );
+                                        status_msg = format!("SQL Error: {}", helpful.lines().next().unwrap_or(""));
+                                        last_error = Some(helpful);
+                                    }
                                 }
                             }
                         }
@@ -374,12 +482,12 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         }
                         KeyCode::Enter => {
                             if let Some(chosen) = browser_items.get(browser_idx) {
-                                if chosen.is_dir && !chosen.path.ends_with("*.log") {
-                                    current_dir = PathBuf::from(&chosen.path);
+                                if chosen.is_dir && !chosen.path.contains('*') {
+                                    current_dir = PathBuf::from(clean_windows_path(&chosen.path));
                                     browser_items = scan_directory(&current_dir);
                                     browser_idx = 0;
                                 } else {
-                                    let new_source = chosen.path.clone();
+                                    let new_source = clean_windows_path(&chosen.path);
                                     let new_engine = LogEngine::new();
                                     match new_engine
                                         .register_source("logs", &new_source, InputFormat::Auto, None)
@@ -399,8 +507,18 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                             } else {
                                                 sql_input = "SELECT * FROM logs LIMIT 50".to_string();
                                             }
-                                            if let Ok(batches) = engine.query(&sql_input).await {
-                                                extract_grid(&batches, &mut headers, &mut table_rows);
+                                            match engine.query(&sql_input).await {
+                                                Ok(batches) => {
+                                                    extract_grid(&batches, &mut headers, &mut table_rows);
+                                                    last_error = None;
+                                                }
+                                                Err(e) => {
+                                                    last_error = Some(format_helpful_error(
+                                                        &e.to_string(),
+                                                        Some(&active_source),
+                                                        &columns,
+                                                    ));
+                                                }
                                             }
                                             status_msg = format!(
                                                 "Loaded `{}` ({:?}) | {} rows",
@@ -411,7 +529,16 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                                             modal = TuiModal::None;
                                         }
                                         Err(e) => {
-                                            status_msg = format!("Failed to load file: {}", e);
+                                            let helpful = format_helpful_error(
+                                                &e.to_string(),
+                                                Some(&new_source),
+                                                &[],
+                                            );
+                                            status_msg = format!(
+                                                "Failed to load file: {}",
+                                                helpful.lines().next().unwrap_or("")
+                                            );
+                                            last_error = Some(helpful);
                                             modal = TuiModal::None;
                                         }
                                     }
@@ -422,9 +549,21 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                     },
                     TuiModal::None => match key.code {
                         KeyCode::Esc => break,
-                        KeyCode::F(1) => modal = TuiModal::Help,
+                        KeyCode::F(1) => {
+                            help_scroll = 0;
+                            modal = TuiModal::Help;
+                        }
                         KeyCode::F(2) => modal = TuiModal::Intents,
                         KeyCode::F(3) => {
+                            browser_items = scan_directory(&current_dir);
+                            browser_idx = 0;
+                            modal = TuiModal::FileBrowser;
+                        }
+                        KeyCode::Char('o')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
                             browser_items = scan_directory(&current_dir);
                             browser_idx = 0;
                             modal = TuiModal::FileBrowser;
@@ -439,32 +578,58 @@ pub async fn run_tui(initial_source: &str, format: InputFormat) -> Result<()> {
                         }
                         KeyCode::Enter => {
                             let (rewritten_sql, extracted_path) = extract_source_from_sql(&sql_input);
-                            if let Some(new_path) = extracted_path {
+                            if let Some(raw_new_path) = extracted_path {
+                                let new_path = clean_windows_path(&raw_new_path);
                                 if new_path != active_source {
                                     let new_engine = LogEngine::new();
-                                    if let Ok(fmt) = new_engine
+                                    match new_engine
                                         .register_source("logs", &new_path, active_format, None)
                                         .await
                                     {
-                                        engine = new_engine;
-                                        active_source = new_path;
-                                        detected_fmt = fmt;
-                                        columns = engine.table_columns("logs").await;
-                                        suggestions =
-                                            generate_intent_suggestions(detected_fmt, &columns);
+                                        Ok(fmt) => {
+                                            engine = new_engine;
+                                            active_source = new_path;
+                                            detected_fmt = fmt;
+                                            columns = engine.table_columns("logs").await;
+                                            suggestions =
+                                                generate_intent_suggestions(detected_fmt, &columns);
+                                        }
+                                        Err(e) => {
+                                            let helpful = format_helpful_error(
+                                                &e.to_string(),
+                                                Some(&new_path),
+                                                &columns,
+                                            );
+                                            status_msg = format!(
+                                                "Source Error: {}",
+                                                helpful.lines().next().unwrap_or("")
+                                            );
+                                            last_error = Some(helpful);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
                             match engine.query(&rewritten_sql).await {
                                 Ok(batches) => {
                                     extract_grid(&batches, &mut headers, &mut table_rows);
+                                    last_error = None;
                                     status_msg = format!(
                                         "Returned {} rows | F1=Help | F2=Intents | F3=Browse Files",
                                         table_rows.len()
                                     );
                                 }
                                 Err(e) => {
-                                    status_msg = format!("SQL Error: {}", e);
+                                    let helpful = format_helpful_error(
+                                        &e.to_string(),
+                                        Some(&active_source),
+                                        &columns,
+                                    );
+                                    status_msg = format!(
+                                        "SQL Error: {}",
+                                        helpful.lines().next().unwrap_or("")
+                                    );
+                                    last_error = Some(helpful);
                                 }
                             }
                         }
@@ -565,22 +730,25 @@ fn apply_tab_autocomplete(
 fn scan_directory(dir: &Path) -> Vec<BrowserItem> {
     let mut items = Vec::new();
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let clean_dir = clean_windows_path(&canonical.to_string_lossy());
     if let Some(parent) = canonical.parent() {
         items.push(BrowserItem {
             name: ".. (Parent Directory)".to_string(),
-            path: parent.to_string_lossy().to_string(),
+            path: clean_windows_path(&parent.to_string_lossy()),
             is_dir: true,
         });
     }
     let sep = std::path::MAIN_SEPARATOR;
-    let glob_str = format!(
-        "{}{}*.log",
-        canonical.to_string_lossy().trim_end_matches(sep),
-        sep
-    );
+    let glob_log_str = format!("{}{}*.log", clean_dir.trim_end_matches(sep), sep);
     items.push(BrowserItem {
-        name: format!("{SYM_SPARK} Query all *.log files in this folder ({})", glob_str),
-        path: glob_str,
+        name: format!("{SYM_SPARK} Query all *.log files in this folder ({})", glob_log_str),
+        path: glob_log_str,
+        is_dir: false,
+    });
+    let glob_csv_str = format!("{}{}*.csv", clean_dir.trim_end_matches(sep), sep);
+    items.push(BrowserItem {
+        name: format!("{SYM_CHART} Query all *.csv files in this folder ({})", glob_csv_str),
+        path: glob_csv_str,
         is_dir: false,
     });
 
@@ -593,11 +761,13 @@ fn scan_directory(dir: &Path) -> Vec<BrowserItem> {
             }
             let path = entry.path();
             let is_dir = path.is_dir();
-            sub_items.push(BrowserItem {
-                name,
-                path: path.to_string_lossy().to_string(),
-                is_dir,
-            });
+            if is_dir || is_supported_log_or_data_file(&path) {
+                sub_items.push(BrowserItem {
+                    name,
+                    path: clean_windows_path(&path.to_string_lossy()),
+                    is_dir,
+                });
+            }
         }
         sub_items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,

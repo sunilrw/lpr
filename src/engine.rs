@@ -1,11 +1,11 @@
 use crate::checkpoint::CheckpointStore;
 use crate::parsers::{
-    detect_format_item, get_format_regex, parse_aws_vpc_files, parse_azure_blob_files,
-    parse_cef_files, parse_cisco_asa_files, parse_cisco_config_files, parse_evtx_files,
-    parse_excel_files, parse_firewall_kv_files, parse_ias_files, parse_json_files,
-    parse_raw_items_parallel, parse_regex_items_parallel_filtered,
-    parse_w3c_items_parallel_filtered, resolve_paths, resolve_source_items, InputFormat,
-    LogSourceItem, ParseStats, ScanPreFilter,
+    clean_windows_path, detect_format_item, get_format_regex, parse_aws_vpc_files,
+    parse_azure_blob_files, parse_cef_files, parse_cisco_asa_files, parse_cisco_config_files,
+    parse_csv_items_parallel, parse_evtx_files, parse_excel_files, parse_firewall_kv_files,
+    parse_ias_files, parse_json_files, parse_parquet_items, parse_raw_items_parallel,
+    parse_regex_items_parallel_filtered, parse_w3c_items_parallel_filtered, resolve_paths,
+    resolve_source_items, InputFormat, LogSourceItem, ParseStats, ScanPreFilter,
 };
 use crate::udfs::register_all_udfs;
 use anyhow::Result;
@@ -429,25 +429,19 @@ impl LogEngine {
                 self.register_batches(table_name, batches)?;
             }
             InputFormat::Csv => {
-                let pp = path_pattern
-                    .ok_or_else(|| anyhow::anyhow!("path pattern required for CSV input"))?;
-                self.ctx
-                    .register_csv(table_name, pp, CsvReadOptions::new())
-                    .await?;
+                let (batches, s) = parse_csv_items_parallel(&items, b',', self.verbose)?;
+                stats = s;
+                self.register_batches(table_name, batches)?;
             }
             InputFormat::Tsv => {
-                let pp = path_pattern
-                    .ok_or_else(|| anyhow::anyhow!("path pattern required for TSV input"))?;
-                self.ctx
-                    .register_csv(table_name, pp, CsvReadOptions::new().delimiter(b'\t'))
-                    .await?;
+                let (batches, s) = parse_csv_items_parallel(&items, b'\t', self.verbose)?;
+                stats = s;
+                self.register_batches(table_name, batches)?;
             }
             InputFormat::Parquet => {
-                let pp = path_pattern
-                    .ok_or_else(|| anyhow::anyhow!("path pattern required for Parquet input"))?;
-                self.ctx
-                    .register_parquet(table_name, pp, ParquetReadOptions::default())
-                    .await?;
+                let (batches, s) = parse_parquet_items(&items, self.verbose)?;
+                stats = s;
+                self.register_batches(table_name, batches)?;
             }
             other => {
                 let pp = path_pattern
@@ -479,6 +473,7 @@ impl LogEngine {
     }
 
     fn register_batches(&self, table_name: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        let _ = self.ctx.deregister_table(table_name);
         let schema = batches[0].schema();
         // Partition batches across DataFusion partitions so multi-core SQL execution runs in parallel across files!
         let partitions: Vec<Vec<RecordBatch>> = batches.into_iter().map(|b| vec![b]).collect();
@@ -505,9 +500,16 @@ impl LogEngine {
         let normalized = normalize_logparser_sql(sql, &cols);
         let df = match self.ctx.sql(&normalized).await {
             Ok(df) => df,
-            Err(_) => self.ctx.sql(sql).await?,
+            Err(_) => self
+                .ctx
+                .sql(sql)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", format_helpful_error(&e.to_string(), None, &cols)))?,
         };
-        let batches = df.collect().await?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", format_helpful_error(&e.to_string(), None, &cols)))?;
         Ok(batches)
     }
 
@@ -518,7 +520,8 @@ impl LogEngine {
     ) -> Result<SchemaDiscovery> {
         let detected = self
             .register_source("logs", path_pattern, format, None)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", format_helpful_error(&e.to_string(), Some(path_pattern), &[])))?;
         let columns = self.table_columns("logs").await;
         let row_count_estimate = match self.query("SELECT COUNT(*) AS cnt FROM logs").await {
             Ok(batches) => batches
@@ -539,6 +542,127 @@ impl LogEngine {
             suggestions,
         })
     }
+}
+
+/// Formats any raw DataFusion, filesystem, or parser error into a clear, actionable diagnostic
+/// message explaining (1) What went wrong, and (2) Exact instructions/commands to solve it.
+pub fn format_helpful_error(
+    raw_msg: &str,
+    source_hint: Option<&str>,
+    available_cols: &[String],
+) -> String {
+    let cleaned = raw_msg.trim();
+    // Avoid double-wrapping if already formatted
+    if cleaned.contains("HOW TO SOLVE IT:") {
+        return cleaned.to_string();
+    }
+
+    let lower = cleaned.to_ascii_lowercase();
+    let src_display = source_hint
+        .map(clean_windows_path)
+        .unwrap_or_else(|| "<your-log-or-csv-path>".to_string());
+
+    // 1. Table 'logs' not found (no file loaded yet or wrong table name in FROM)
+    if lower.contains("table 'datafusion.public.") && lower.contains("not found") {
+        let is_logs_table = lower.contains("table 'datafusion.public.logs' not found");
+        if is_logs_table && available_cols.is_empty() {
+            return format!(
+                "No log or CSV file is currently loaded into the `logs` table.\n\
+                 WHAT IS WRONG:\n  \
+                   The SQL engine tried to query `FROM logs`, but no valid log/data file has been loaded yet.\n\
+                 HOW TO SOLVE IT:\n  \
+                   • In TUI (`lpr tui`): Press `o` to open the File Browser, select a `.log`, `.csv`, `.json`, or `.zip` file, and press Enter.\n  \
+                   • In Web Studio (`lpr serve`): Click `Browse...` at the top, select a log/CSV file, and click `Run SQL`.\n  \
+                   • In CLI: Pass `-f <path>` or put the file path inside SQL `FROM '<path>'`, e.g.:\n    \
+                     lpr -f \"D:\\Logs\\W3SVC1\\*.log\" \"SELECT * FROM logs LIMIT 50\""
+            );
+        } else {
+            return format!(
+                "{}\n\
+                 WHAT IS WRONG:\n  \
+                   Your SQL query referenced a table name that is not registered.\n\
+                 HOW TO SOLVE IT:\n  \
+                   • Always use `FROM logs` as the table name (or `FROM 'D:\\path\\to\\file.log'`).\n  \
+                   • Example: SELECT * FROM logs LIMIT 50",
+                cleaned
+            );
+        }
+    }
+
+    // 2. Column not found (`No field named ...`)
+    if lower.contains("no field named") {
+        let cols_preview = if available_cols.is_empty() {
+            "(No columns loaded — open a file first or run `lpr suggest <file>` to inspect columns)".to_string()
+        } else {
+            available_cols.join(", ")
+        };
+        return format!(
+            "{}\n\
+             WHAT IS WRONG:\n  \
+               The SQL query referenced a column name that does not exist in the currently loaded file (`{}`).\n\
+             AVAILABLE COLUMNS IN THIS FILE ({}):\n  \
+               {}\n\
+             HOW TO SOLVE IT:\n  \
+               • Replace the missing column in your `SELECT` / `WHERE` clause with one of the available columns listed above.\n  \
+               • Or run `SELECT * FROM logs LIMIT 50` to inspect all columns in this file.",
+            cleaned,
+            src_display,
+            available_cols.len(),
+            cols_preview
+        );
+    }
+
+    // 3. File / Path / Object Store error
+    if lower.contains("no log")
+        || lower.contains("matched")
+        || lower.contains("object store")
+        || lower.contains("invalid path")
+        || lower.contains("failed to open")
+        || lower.contains("cannot find the path")
+        || lower.contains("os error")
+    {
+        return format!(
+            "{}\n\
+             WHAT IS WRONG:\n  \
+               Could not open or find any supported log/data files at `{}`.\n\
+             HOW TO SOLVE IT:\n  \
+               • Check that the file or folder path exists and is readable.\n  \
+               • Supported formats: `.log`, `.csv`, `.tsv`, `.json`, `.zip`, `.gz`, `.zst`, `.evtx`, `.xlsx`, `.parquet`, `.cfg`.\n  \
+               • On Windows, wrap paths with spaces or wildcards in double quotes: `-f \"D:\\Logs\\W3SVC1\\*.log\"`.\n  \
+               • In TUI (`lpr tui`), press `o` to browse and pick a file; in Web Studio (`lpr serve`), click `Browse...`.",
+            cleaned, src_display
+        );
+    }
+
+    // 4. SQL parser syntax error
+    if lower.contains("sql parser error") || lower.contains("expected:") {
+        return format!(
+            "{}\n\
+             WHAT IS WRONG:\n  \
+               The SQL query has a syntax error.\n\
+             HOW TO SOLVE IT:\n  \
+               • Enclose string literals and `LIKE` patterns in single quotes (`'...'`), e.g.:\n    \
+                 SELECT * FROM logs WHERE sc_status = '500' AND cs_uri_stem LIKE '%/api/%' LIMIT 50\n  \
+               • Wrap column names containing special characters in square brackets (`[cs-uri-stem]`) or use underscores (`cs_uri_stem`).\n  \
+               • Run `lpr help-full` (or press `F1` in TUI) to see copy-pasteable SQL examples.",
+            cleaned
+        );
+    }
+
+    // 5. Fallback general diagnostic
+    let cols_note = if !available_cols.is_empty() {
+        format!("\nAVAILABLE COLUMNS ({}):\n  {}", available_cols.len(), available_cols.join(", "))
+    } else {
+        String::new()
+    };
+    format!(
+        "{}{}\n\
+         HOW TO SOLVE IT:\n  \
+           • Try running `SELECT * FROM logs LIMIT 50` first to verify the loaded columns and data.\n  \
+           • Run `lpr suggest \"{}\"` to get ready-to-run SQL queries tailored to this file.\n  \
+           • Run `lpr help-full` or `lpr --help` for complete parameter & SQL syntax examples.",
+        cleaned, cols_note, src_display
+    )
 }
 
 pub fn generate_intent_suggestions(
@@ -702,6 +826,43 @@ pub fn generate_intent_suggestions(
                     category: "Privacy".to_string(),
                     description: "Mask email addresses in user fields using mask_pii()".to_string(),
                     sql: "SELECT timestamp, service, event, mask_pii(\"user\") AS redacted_user, ip, status FROM logs".to_string(),
+                });
+            }
+        }
+        InputFormat::Csv | InputFormat::Tsv | InputFormat::Excel | InputFormat::Parquet => {
+            list.push(IntentSuggestion {
+                title: "Preview First 50 Records".to_string(),
+                category: "Explore".to_string(),
+                description: "Inspect all columns in the selected CSV / tabular file".to_string(),
+                sql: "SELECT * FROM logs LIMIT 50".to_string(),
+            });
+            if has("server_name") && has("cs_uri_stem") && has("sc_status") {
+                list.push(IntentSuggestion {
+                    title: "Hits by Server & Status Code".to_string(),
+                    category: "Fleet CSV".to_string(),
+                    description: "Group fleet CSV records by server_name and sc_status".to_string(),
+                    sql: "SELECT server_name, sc_status, COUNT(*) AS hits FROM logs GROUP BY 1, 2 ORDER BY hits DESC".to_string(),
+                });
+                list.push(IntentSuggestion {
+                    title: "Top Endpoints in Fleet Report".to_string(),
+                    category: "Fleet CSV".to_string(),
+                    description: "Group fleet CSV records by cs_uri_stem and sc_status".to_string(),
+                    sql: "SELECT cs_uri_stem, sc_status, COUNT(*) AS hits FROM logs GROUP BY 1, 2 ORDER BY hits DESC LIMIT 25".to_string(),
+                });
+            } else if has("url_path") && has("status_code") {
+                list.push(IntentSuggestion {
+                    title: "Top Failing Endpoints Across Fleet".to_string(),
+                    category: "Fleet Summary".to_string(),
+                    description: "Rank summary CSV rows by error_hits descending".to_string(),
+                    sql: "SELECT * FROM logs ORDER BY CAST(error_hits AS INT) DESC LIMIT 25".to_string(),
+                });
+            }
+            if has("journey_id") && has("step_num") {
+                list.push(IntentSuggestion {
+                    title: "View Reconstructed Customer Journeys".to_string(),
+                    category: "Journey Trace".to_string(),
+                    description: "Order cross-server user journey steps chronologically".to_string(),
+                    sql: "SELECT journey_id, step_num, date, time, server_name, cs_method, cs_uri_stem, sc_status, time_taken, matched_identifiers FROM logs ORDER BY CAST(journey_id AS INT), CAST(step_num AS INT)".to_string(),
                 });
             }
         }

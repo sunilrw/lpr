@@ -45,8 +45,33 @@ pub fn get_ascii_banner() -> String {
     name = "lpr",
     version = LPR_VERSION,
     disable_version_flag = true,
-    about = "Modern Multi-Threaded Rust SQL Log Parser & Security Auditor (Log Parser 2.2 + Linux + .NET/PS + REST API + MCP)",
-    long_about = "High-performance vectorized & multi-threaded log engine powered by Apache Arrow, DataFusion & Rayon.\nReads uncompressed logs, .zip archives, .gz, and .zst streams directly across CPU cores.\nSupports ANSI SQL, Microsoft Log Parser 2.2 syntax (`-i:IISW3C`, `SELECT TOP 10 ... INTO out.csv FROM *.log`), Linux CLI filters (`-g`, `-v`, `-F`, `--stats`, `stdin` pipes), .NET/PowerShell integration (`lpr sdk`), HTTP REST API (`lpr serve`), and AI MCP (`lpr mcp`)."
+    about = "Modern Multi-Threaded Rust SQL Log Parser, Fleet Scanner, Journey Tracer & Security Auditor",
+    long_about = "High-performance vectorized & multi-threaded log engine powered by Apache Arrow, DataFusion & Rayon.\nReads uncompressed logs, CSVs, .zip archives, .gz, and .zst streams directly across CPU cores.\nSupports ANSI SQL, Microsoft Log Parser 2.2 syntax (`-i:IISW3C`, `SELECT TOP 10 ... INTO out.csv FROM *.log`), multi-server fleet scanning (`lpr fleet`), deterministic session intelligence & cross-server user journey reconstruction (`--learn`, `--trace`, `--customer`, `--trace-ip`), Linux CLI filters (`-g`, `-v`, `-F`, `--stats`), .NET/PowerShell integration (`lpr sdk`), HTTP Web Studio (`lpr serve`), Terminal UI (`lpr tui`), and AI MCP (`lpr mcp`).",
+    after_help = r#"COMPLETE EXAMPLES & COMMON WORKFLOWS:
+  1. Single-File / Wildcard / Archive SQL Query (Log Parser 2.2 & ANSI SQL):
+     lpr -f "D:\Logs\W3SVC1\*.log" "SELECT TOP 25 date, time, c_ip, cs_uri_stem, sc_status, time_taken FROM logs WHERE sc_status LIKE '5%'"
+     lpr -i:IISW3C "SELECT cs-uri-stem, sc-status, COUNT(*) AS hits INTO summary.csv FROM 'D:\Logs\*.log' GROUP BY 1, 2 ORDER BY hits DESC"
+     lpr -f "output\Report.csv" "SELECT * FROM logs LIMIT 50"
+
+  2. Multi-Server Fleet Scanner & Time Windows (`lpr fleet --help` for all fleet flags):
+     lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path "D:\Logs\AcmeStore" -j 8
+     lpr fleet --hours 12 --status 302 -g "/partner-api/"
+     lpr fleet -d 1 --status 500
+     lpr fleet --latest --status 5
+     lpr fleet -d 1 --sql "SELECT date, time, cs_method, cs_uri_stem, sc_status FROM logs WHERE cs_uri_stem LIKE '%/partner-api/%'"
+
+  3. Session Intelligence & Cross-Server User Journey Reconstruction (No AI):
+     lpr fleet --learn --latest                                           # Learn session cookies, query params & X-Forwarded-For
+     lpr fleet -d 1 --customer "CUST-99481"                               # Trace full journey of a Customer ID / Session ID / Order ID
+     lpr fleet -d 1 --trace-ip "203.0.113.45"                             # Trace full journey by Clear Client IP or X-Forwarded-For IP
+     lpr fleet --hours 12 --status 500 -g "/checkout/payment" --trace     # Trace journeys of ALL customers who failed payment
+
+  4. Command History, Saved Profiles, TUI & Web Studio:
+     lpr history  |  lpr history -i (DOS Up/Down arrows)  |  lpr --rerun 5  |  lpr !5
+     lpr config   |  lpr config --set-default ProdWeb
+     lpr tui -f "D:\Logs\u_ex261016.log"                                  # Interactive Terminal UI (F1=Help, F2=Intents, F3=Browse)
+     lpr serve --bind 127.0.0.1:8080                                      # Web Studio UI & REST API
+     lpr help-full                                                        # Print the complete multi-page reference manual"#
 )]
 struct Cli {
     /// Print version information
@@ -275,8 +300,29 @@ enum Commands {
         source: Option<String>,
     },
 
-    /// Zero-script multi-server IIS fleet error scanner (supports saved profiles in lpr.config.json, servers.csv, or host patterns)
-    #[command(alias = "scan-500")]
+    /// Zero-script multi-server IIS & Linux fleet scanner + cross-server customer journey tracer (supports saved profiles in lpr.config.json, servers.csv, or host patterns)
+    #[command(
+        alias = "scan-500",
+        after_help = r#"FLEET SCANNER & CROSS-SERVER JOURNEY TRACER EXAMPLES:
+  • Save a server farm profile once (auto-sets as default profile):
+    lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path "D:\Logs\AcmeStore" --archive-path "D:\OldLogs\AcmeStore" -j 8
+
+  • Scan last 12 hours or 1 day across all servers for 302 redirects or 500 errors:
+    lpr fleet --hours 12 --status 302 -g "/partner-api/"
+    lpr fleet -d 1 --status 500
+    lpr fleet --latest --status 5
+
+  • Run custom SQL across all servers in parallel:
+    lpr fleet -d 1 --sql "SELECT date, time, cs_method, cs_uri_stem, cs_uri_query, sc_status FROM logs WHERE cs_uri_stem LIKE '%/partner-api/%'"
+
+  • Learn deterministic session/cookie/query/IP intelligence from server logs & save into lpr.config.json:
+    lpr fleet --learn --latest
+
+  • Reconstruct full chronological cross-server user journeys (even without sticky sessions):
+    lpr fleet -d 1 --customer "CUST-99481"                               # Specific Customer ID / Session ID / Order ID / Cookie
+    lpr fleet -d 1 --trace-ip "203.0.113.45"                             # Specific Clear Client IP or X-Forwarded-For IP
+    lpr fleet --hours 12 --status 500 -g "/checkout/payment" --trace     # All customers who failed payment or hit 500"#
+    )]
     Fleet {
         /// Number of days to look back (inclusive, default: 7)
         #[arg(short = 'd', long = "days", conflicts_with = "hours")]
@@ -639,55 +685,101 @@ pub fn print_full_manual() {
     let _ = writeln!(
         out,
         r#"
-{SYM_BOOKS} LPR v1.3.0 COMPLETE REFERENCE MANUAL (MULTI-THREADED + ZIP/GZ/ZST + LOG PARSER 2.2 + LINUX)
+{SYM_BOOKS} LPR v{} COMPLETE REFERENCE MANUAL (FLEET + JOURNEY TRACER + SQL + LOG PARSER 2.2 + LINUX + TUI/WEB)
 ================================================================================
 
-1. DIRECT .ZIP, .GZ, AND .ZST ARCHIVE & MULTI-THREADED QUERYING
+1. DIRECT .LOG, .CSV, .ZIP, .GZ, AND .ZST ARCHIVE & MULTI-THREADED QUERYING
 --------------------------------------------------------------------------------
-  • Query a .zip archive containing multiple IIS or Linux log files in parallel across all CPU threads:
-    lpr -f logs_archive.zip "SELECT sc-status, COUNT(*) AS hits FROM logs GROUP BY 1 ORDER BY hits DESC"
-  • Control thread count (`-j` / `--threads`) and show per-file verbose progress (`-V` / `--verbose`):
+  • Query a single file, wildcard glob, CSV report, or .zip archive in parallel across CPU threads:
+    lpr -f "D:\Logs\W3SVC1\*.log" "SELECT sc_status, COUNT(*) AS hits FROM logs GROUP BY 1 ORDER BY hits DESC"
+    lpr -f "output\Report.csv" "SELECT * FROM logs LIMIT 50"
     lpr -j 8 -V -f "logs_archive.zip" "SELECT * FROM logs WHERE sc-status LIKE '5%' INTO 500_errors.csv"
 
-2. MULTI-SERVER FLEET SCANNER & SAVED PROFILES (WINDOWS IIS + LINUX NGINX/APACHE/CADDY/HAPROXY/TOMCAT)
+2. MULTI-SERVER FLEET SCANNER & SAVED PROFILES (`lpr fleet` & `lpr config`)
 --------------------------------------------------------------------------------
-  • Save a Windows IIS server farm profile once (auto-discovers W3SVC paths from applicationHost.config or uses --log-path):
-    lpr fleet --save-profile prod-iis --servers servers.csv --site W3SVC1 --threads 8 --days 7
-  • Save a Linux Nginx/Apache/Caddy server farm profile over SSH (streams & decompresses .log / .gz remotely):
-    lpr fleet --save-profile prod-linux --servers linux_servers.csv --server-type nginx --ssh --ssh-user ubuntu --log-path /var/log/nginx
-  • Run saved profile anytime (or filter server numbers 1-12):
-    lpr fleet --profile prod-iis --server-numbers "1-12" --days 3
-  • View or manage saved profiles in `lpr.config.json`:
+  • Save a Windows IIS server farm profile once (auto-saved as default in `lpr.config.json`):
+    lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path "D:\Logs\AcmeStore" --archive-path "D:\OldLogs\AcmeStore" -j 8
+  • Save a Linux Nginx/Apache/Caddy server farm profile over SSH:
+    lpr fleet --save-profile ProdLinux --servers linux_servers.csv --server-type nginx --ssh --ssh-user ubuntu --log-path /var/log/nginx
+  • Time Windows (`--hours N`, `-d N` / `--days N`, `--latest`):
+    lpr fleet --hours 12 --status 302 -g "/partner-api/"     # Rolling last 12 hours across all servers
+    lpr fleet -d 1 --status 500                              # Today's logs across all servers
+    lpr fleet --latest --status 5                            # Newest active log file per server only
+  • Custom SQL Across All Servers (`--sql` with automatic raw-byte `LIKE` & status pushdown):
+    lpr fleet -d 1 --sql "SELECT date, time, cs_method, cs_uri_stem, cs_uri_query, sc_status FROM logs WHERE cs_uri_stem LIKE '%/partner-api/%'"
+  • Filter Specific Servers (`--server-numbers`, `--server-filter`):
+    lpr fleet --server-numbers "1-6,10" -d 1 --status 500
+    lpr fleet --server-filter "vm-web-prod-0*" -d 1
+  • View or change default saved profile in `lpr.config.json`:
     lpr config
+    lpr config --set-default ProdWeb
 
-3. LOGGING, VERBOSITY & TABLE FORMATTING OPTIONS
+3. DETERMINISTIC SESSION INTELLIGENCE & CROSS-SERVER USER JOURNEY RECONSTRUCTION (NO AI)
 --------------------------------------------------------------------------------
-  • Default Mode:     Shows startup banner, execution plan, and final Log Parser statistics summary
+  • Step 1 — Learn Session Intelligence (`--learn` / `--learn-intelligence`):
+    Scans W3C `#Fields`, `cs(Cookie)` keys, `cs-uri-query` keys, `X-Forwarded-For` / `CF-Connecting-IP`, and `c-ip`,
+    classifying high-cardinality per-user session tokens vs static site config cookies, and saves to `lpr.config.json`:
+    lpr fleet --learn --latest
+    lpr fleet --learn --server-numbers "1-3" --latest
+
+  • Step 2A — Trace a Specific Customer ID, Session ID, Order ID, or Cookie (`--customer` / `--trace-id` / `--journey`):
+    lpr fleet -d 1 --customer "CUST-99481"
+    lpr fleet --hours 12 --trace-id "ASP.NET_SessionId=xyz987abc"
+
+  • Step 2B — Trace by Clear Client IP or X-Forwarded-For IP (`--trace-ip`):
+    lpr fleet -d 1 --trace-ip "203.0.113.45"
+
+  • Step 2C — Cohort Trace (`--trace`): Find ALL customers matching an error/redirect and reconstruct their full journeys:
+    lpr fleet --hours 12 --status 500 -g "/checkout/payment" --trace --trace-window-mins 15 --max-journeys 25
+    lpr fleet --hours 12 --status 302 -g "/partner-api/" --trace
+
+4. COMMAND HISTORY & INTERACTIVE DOS UP/DOWN ARROW BROWSER (`lpr history`)
+--------------------------------------------------------------------------------
+  • List up to 100 unique saved commands in `lpr.config.json`:
+    lpr history                  (or `lpr -H`)
+    lpr history -s "302"         (filter saved commands by keyword)
+  • Browse interactively with Up/Down arrows and press Enter to execute:
+    lpr history -i               (or `lpr --browse-history` / `lpr --doskey`)
+  • Rerun a command by its 1-based number or rerun the last command:
+    lpr --rerun 33               (or `lpr history 33` or `lpr !33`)
+    lpr --rerun last             (or `lpr !!`)
+
+5. INTERACTIVE TERMINAL UI (`lpr tui`) & WEB STUDIO (`lpr serve`)
+--------------------------------------------------------------------------------
+  • Terminal UI Dashboard (`F1`=Help Manual, `F2`=Smart SQL Intents, `F3` / `Ctrl+O`=File Browser, `Tab`=Autocomplete):
+    lpr tui
+    lpr tui -f "D:\Logs\W3SVC1\u_ex261016.log"
+  • Web Studio Console & HTTP REST API (File Browser, SQL Editor, 360° Security Audit, CSV/JSON Export):
+    lpr serve --bind 127.0.0.1:8080
+    lpr serve --source "D:\Logs\W3SVC1\*.log"
+
+6. LOGGING, VERBOSITY & TABLE FORMATTING OPTIONS
+--------------------------------------------------------------------------------
+  • Default Mode:       Shows startup banner, execution plan, per-server timings, and Robocopy/LogParser summary table
   • `-V` / `--verbose`: Prints per-file progress (file name, line count, parsed rows, elapsed ms)
-  • `--no-verbose`:   Disables per-file progress lines while keeping the startup header and final summary
-  • `--log-file <f>`: Writes execution plan, per-file progress, and summary stats to a log file
-  • `-q` / `--no-log`: Quiet mode — suppresses all banners, progress, and statistics (pure data output)
-  • `--max-width 80`: Truncates wide table cells (like huge cookies) so ASCII tables fit cleanly on screen (`--max-width 0` for full width)
+  • `--no-verbose`:     Disables per-file progress lines while keeping the startup header and final summary
+  • `--log-file <f>`:   Writes execution plan, per-file progress, and summary stats to a log file
+  • `-q` / `--no-log`:  Quiet mode — suppresses all banners, progress, and statistics (pure data output)
+  • `--max-width 80`:   Truncates wide table cells so ASCII tables fit cleanly (`--max-width 0` for unlimited width)
   • `-G` / `--vertical`: Displays each record vertically (`key : value` cards) for wide logs
 
-4. MICROSOFT LOG PARSER 2.2 DROP-IN SYNTAX
+7. MICROSOFT LOG PARSER 2.2 DROP-IN SYNTAX
 --------------------------------------------------------------------------------
   • Query files/globs/zips in SQL FROM & write to file via SQL INTO:
     lpr -i:IISW3C "SELECT TOP 10 cs-uri-stem, [sc-status], [time-taken] INTO out.csv FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%'"
   • Colon Flags & Virtual Columns (LogFilename, LogRow):
     lpr -i:W3C -o:DATAGRID "SELECT LogFilename, LogRow, c-ip, sc-status, win32_error_description(sc-win32-status) FROM samples/*.log"
 
-5. LINUX POWER-TOOL SYNTAX (GREP / AWK / GOACCESS / LNAV / STDIN PIPES)
+8. LINUX POWER-TOOL SYNTAX (GREP / AWK / GOACCESS / LNAV / STDIN PIPES)
 --------------------------------------------------------------------------------
   • Grep & Invert-Grep with Structured Table Output (`-g`, `-v`, `-c`, `-F`):
     lpr -f samples/iis/u_extend01.log -g "500" -F date,time,c_ip,cs_uri_stem,sc_status,time_taken
   • GoAccess-style Instant Traffic, SMTP & Threat Summary (`--stats` or `-stats:ON`):
     lpr -f samples/iis/u_extend01.log --stats
-    lpr -f samples/iis_smtp/u_ex260101.log --stats
   • Terminal Horizontal Bar Charts (`-o chart` / `-o:CHART`):
     lpr -f samples/iis/u_extend01.log -o:CHART "SELECT sc-status, COUNT(*) AS hits FROM logs GROUP BY 1 ORDER BY hits DESC"
 
-6. BUILT-IN CYBERSECURITY & LOG PARSER 2.2 SQL UDFs (23 FUNCTIONS)
+9. BUILT-IN CYBERSECURITY & LOG PARSER 2.2 SQL UDFs (23 FUNCTIONS)
 --------------------------------------------------------------------------------
   • Cyber & Email UDFs: detect_threat(col), ip_in_cidr(ip, cidr), shannon_entropy(col), mask_pii(col),
                         cluster_template(col), url_decode(col), parse_ua(col), extract_email(col), extract_domain(col)
@@ -695,7 +787,8 @@ pub fn print_full_manual() {
                         extract_filename(p), extract_path(p), extract_extension(p),
                         win32_error_description(code), reversedns(ip), to_timestamp(d, t),
                         index_of(s, sub), strlen(s), to_uppercase(s), to_lowercase(s), to_int(s), to_real(s)
-"#
+"#,
+        LPR_VERSION
     );
 }
 
@@ -871,7 +964,21 @@ fn resolve_history_rerun_args(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run_cli().await {
+        let helpful = engine::format_helpful_error(&e.to_string(), None, &[]);
+        eprintln!("================================================================================");
+        eprintln!(" {SYM_WARN}  LPR DIAGNOSTIC & TROUBLESHOOTING GUIDE");
+        eprintln!("================================================================================");
+        for line in helpful.lines() {
+            eprintln!(" {}", line);
+        }
+        eprintln!("================================================================================");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> Result<()> {
     let mut raw_args: Vec<String> = std::env::args().collect();
 
     // If invoked with zero arguments, show banner + quick-start + help
@@ -883,10 +990,12 @@ async fn main() -> Result<()> {
         let _ = writeln!(out, "  • Verbose Multi-Thread: lpr -V -j 8 -f samples/iis/u_extend01.log \"SELECT sc-status, COUNT(*) FROM logs GROUP BY 1\"");
         let _ = writeln!(out, "  • Linux grep / awk:     lpr -f samples/iis/u_extend01.log -g 500 -F date,time,c_ip,cs_uri_stem,sc_status");
         let _ = writeln!(out, "  • GoAccess Summary:     lpr -f samples/iis/u_extend01.log --stats");
-        let _ = writeln!(out, "  • Fleet Server Scanner: lpr fleet --save-profile prod-web --servers servers.csv --site W3SVC1 --threads 8");
+        let _ = writeln!(out, "  • Fleet Server Scanner: lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --threads 8");
+        let _ = writeln!(out, "  • Fleet Hours / Filter: lpr fleet --hours 12 --status 302 -g \"/partner-api/\"");
+        let _ = writeln!(out, "  • User Journey Tracer:  lpr fleet --learn --latest   |   lpr fleet -d 1 --customer \"CUST-99481\"");
         let _ = writeln!(out, "  • Command History/DOS:  lpr history   |   lpr --rerun 33   |   lpr history -i (Up/Down Arrows)");
         let _ = writeln!(out, "  • Smart SQL Intents:    lpr suggest samples/iis/u_extend01.log");
-        let _ = writeln!(out, "  • PowerShell / .NET C#: lpr sdk");
+        let _ = writeln!(out, "  • Launch Terminal UI:   lpr tui");
         let _ = writeln!(out, "  • Launch Web Studio:    lpr serve");
         let _ = writeln!(out, "  • Full Manual & UDFs:   lpr help-full\n");
         let help_str = Cli::command().render_help().to_string();

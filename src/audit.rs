@@ -177,6 +177,29 @@ fn get_rules_for_format(fmt: InputFormat) -> Vec<AuditRule> {
                 remediation: "Investigate failed authentication or password reset events for credential stuffing or brute-force activity.",
             },
         ],
+        InputFormat::Csv | InputFormat::Tsv | InputFormat::Excel | InputFormat::Parquet => vec![
+            AuditRule {
+                severity: "HIGH",
+                category: "CSV_IIS_5XX_ERRORS",
+                title: "HTTP 5xx Server Errors in CSV Report",
+                sql: "SELECT cs_method, cs_uri_stem, sc_status, sc_substatus, sc_win32_status, COUNT(*) AS failures FROM logs WHERE sc_status LIKE '5%' GROUP BY 1, 2, 3, 4, 5 ORDER BY failures DESC LIMIT 25",
+                remediation: "Review IIS 5xx status, substatus, and win32 error codes for failing application endpoints.",
+            },
+            AuditRule {
+                severity: "HIGH",
+                category: "CSV_FLEET_SUMMARY_5XX",
+                title: "Aggregated Fleet 5xx Server Errors in Summary CSV",
+                sql: "SELECT url_path, status_code, substatus, win32_status, error_hits, max_time_taken_ms FROM logs WHERE status_code LIKE '5%' ORDER BY CAST(error_hits AS INT) DESC LIMIT 25",
+                remediation: "Investigate high-frequency 5xx endpoints and slow max_time_taken_ms responses across servers.",
+            },
+            AuditRule {
+                severity: "CRITICAL",
+                category: "CSV_THREAT_SCAN",
+                title: "Exploit Signatures (SQLi / XSS / LFI / RCE) in URI or Query Columns",
+                sql: "SELECT cs_uri_stem, SUBSTR(COALESCE(cs_uri_query, ''), 1, 70) AS query_preview, sc_status, detect_threat(cs_uri_stem || ' ' || COALESCE(cs_uri_query, '')) AS threat FROM logs WHERE detect_threat(cs_uri_stem || ' ' || COALESCE(cs_uri_query, '')) != 'CLEAN' LIMIT 25",
+                remediation: "Block offending client IPs at WAF and parameterize targeted application endpoints.",
+            },
+        ],
         _ => vec![
             AuditRule {
                 severity: "HIGH",

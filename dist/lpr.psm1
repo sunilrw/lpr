@@ -18,7 +18,7 @@ function Invoke-LprQuery {
 }
 
 # Example 1: Query IIS W3C 5xx errors as native PowerShell objects:
-# $errors = Invoke-LprQuery "SELECT * FROM 'D:\emLogs\*.log' WHERE sc-status LIKE '5%'"
+# $errors = Invoke-LprQuery "SELECT * FROM 'D:\Logs\AcmeStore\*.log' WHERE sc-status LIKE '5%'"
 # $errors | Where-Object { [int]$_.time_taken -gt 1000 } | Format-Table c_ip, cs_uri_stem, sc_status, time_taken
 
 # Example 2: Pipe PowerShell Get-Content / Get-WinEvent into lpr stdin:

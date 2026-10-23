@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>lpr Studio v1.1.0 — Modern SQL Log Parser & Security Auditor</title>
+  <title>lpr Studio v1.4.4 — Modern SQL Log Parser, Fleet Scanner &amp; Security Auditor</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -38,7 +38,7 @@
       <div>
         <div class="flex items-center gap-2">
           <span class="text-base font-bold tracking-tight text-white">lpr Studio</span>
-          <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.1.0</span>
+          <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">v1.4.4</span>
           <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
             <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span> DataFusion 42
           </span>
@@ -264,8 +264,8 @@
     <!-- TAB 3: Full Help & Reference Manual -->
     <div id="tab-docs" class="hidden space-y-6">
       <div class="p-5 rounded-2xl bg-gradient-to-r from-indigo-950/40 via-slate-900 to-slate-900 border border-indigo-500/20">
-        <h2 class="text-lg font-bold text-white">📚 lpr v1.1.0 Complete Help Manual &amp; SQL Reference</h2>
-        <p class="text-xs text-slate-300 mt-1">Click any example query below to load it directly into the SQL editor.</p>
+        <h2 class="text-lg font-bold text-white">📚 lpr v1.4.4 Complete Help Manual, Fleet Scanner, Journey Tracer &amp; SQL Reference</h2>
+        <p class="text-xs text-slate-300 mt-1">Click any example SQL query below to load it directly into the SQL editor, or copy the CLI commands for multi-server operations.</p>
       </div>
 
       <!-- Section A: Microsoft Log Parser 2.2 Compatibility Guide -->
@@ -274,7 +274,7 @@
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
           <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
             <div class="font-bold text-white">Direct File/Glob in SQL <code>FROM</code></div>
-            <p class="text-slate-400">Query files or wildcards directly inside your SQL query without needing <code>-f</code>.</p>
+            <p class="text-slate-400">Query files, CSV reports, or wildcards directly inside your SQL query without needing <code>-f</code>.</p>
             <button onclick="useDocQuery(`SELECT * FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%'`)" class="w-full text-left p-2 rounded bg-slate-950 border border-slate-800 hover:border-indigo-500 mono text-[11px] text-emerald-300 transition">
               SELECT * FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%'
             </button>
@@ -287,8 +287,8 @@
             </button>
           </div>
           <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
-            <div class="font-bold text-white">Encoding Resilience (UTF-16 &amp; ANSI)</div>
-            <p class="text-slate-400">Automatically decodes UTF-16LE/BE BOM and Windows-1252 / Latin-1 IIS logs with zero UTF-8 stream errors.</p>
+            <div class="font-bold text-white">Encoding &amp; Windows Path Resilience</div>
+            <p class="text-slate-400">Automatically handles Windows drive paths (<code>D:\...</code>), UNC shares (<code>\\server\d$\...</code>), UTF-16LE/BE BOM, and Latin-1 logs.</p>
             <div class="p-2 rounded bg-slate-950 border border-slate-800 mono text-[11px] text-cyan-300">
               lpr -i:IISW3C -o:CSV "SELECT * FROM *.log"
             </div>
@@ -296,9 +296,43 @@
         </div>
       </div>
 
-      <!-- Section B: Cyber & Log Parser SQL UDFs -->
+      <!-- Section B: Multi-Server Fleet Scanner & Cross-Server User Journey Reconstruction -->
+      <div class="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3 text-xs">
+        <h3 class="text-sm font-bold uppercase tracking-wider text-indigo-400">2. Multi-Server Fleet Scanner &amp; Cross-Server User Journey Reconstruction (No AI)</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="space-y-2">
+            <div class="font-bold text-white">Multi-Server Fleet Scanning &amp; Time Windows</div>
+            <div class="space-y-1.5 mono text-[11px] text-slate-300 bg-slate-950 p-3 rounded-xl border border-slate-800">
+              <div><span class="text-emerald-400"># Save server farm profile once:</span></div>
+              <div>lpr fleet --save-profile ProdWeb --servers servers.csv --site AcmeStore --log-path "D:\Logs\AcmeStore" --threads 8</div>
+              <div><span class="text-emerald-400"># Scan last 12 hours or 1 day across all servers:</span></div>
+              <div>lpr fleet --hours 12 --status 302 -g "/partner-api/"</div>
+              <div>lpr fleet -d 1 --status 500</div>
+              <div><span class="text-emerald-400"># Scan only the newest active log file per server:</span></div>
+              <div>lpr fleet --latest --status 5</div>
+              <div><span class="text-emerald-400"># Run custom SQL across all servers in parallel:</span></div>
+              <div>lpr fleet -d 1 --sql "SELECT date, time, cs_method, cs_uri_stem, sc_status FROM logs WHERE cs_uri_stem LIKE '%/partner-api/%'"</div>
+            </div>
+          </div>
+          <div class="space-y-2">
+            <div class="font-bold text-white">Session Intelligence &amp; User Journey Reconstruction</div>
+            <div class="space-y-1.5 mono text-[11px] text-slate-300 bg-slate-950 p-3 rounded-xl border border-slate-800">
+              <div><span class="text-cyan-400"># Step 1: Learn session cookies, query keys &amp; X-Forwarded-For (saved in lpr.config.json):</span></div>
+              <div>lpr fleet --learn --latest</div>
+              <div><span class="text-cyan-400"># Step 2A: Trace full journey of a specific Customer ID, Session ID, or Order ID:</span></div>
+              <div>lpr fleet -d 1 --customer "CUST-99481"</div>
+              <div><span class="text-cyan-400"># Step 2B: Trace full journey by Clear Client IP or X-Forwarded-For IP:</span></div>
+              <div>lpr fleet -d 1 --trace-ip "203.0.113.45"</div>
+              <div><span class="text-cyan-400"># Step 2C: Trace journeys of ALL customers who failed payment or hit 500/302:</span></div>
+              <div>lpr fleet --hours 12 --status 500 -g "/checkout/payment" --trace</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Section C: Cyber & Log Parser SQL UDFs -->
       <div class="space-y-3">
-        <h3 class="text-sm font-bold uppercase tracking-wider text-indigo-400">2. Built-in Cyber Security &amp; Log Parser SQL Functions (UDFs)</h3>
+        <h3 class="text-sm font-bold uppercase tracking-wider text-indigo-400">3. Built-in Cyber Security &amp; Log Parser SQL Functions (UDFs)</h3>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
             <div class="flex items-center justify-between">
@@ -368,17 +402,18 @@
         </div>
       </div>
 
-      <!-- Section C: CLI, Linux Tools, PowerShell, .NET C# & MCP Reference -->
+      <!-- Section D: CLI, History, Linux Tools, PowerShell, .NET C# & MCP Reference -->
       <div class="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3 text-xs">
-        <h3 class="text-sm font-bold uppercase tracking-wider text-indigo-400">3. CLI, Linux Power-Tools, PowerShell, .NET C#, REST API &amp; MCP</h3>
+        <h3 class="text-sm font-bold uppercase tracking-wider text-indigo-400">4. CLI Parameters, Command History, Linux Tools, PowerShell, .NET C# &amp; MCP</h3>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="space-y-1.5 mono text-[11px] text-slate-300">
             <div><span class="text-indigo-400">lpr -i:IISW3C "SELECT TOP 5 ... INTO out.csv FROM *.log"</span> # Log Parser 2.2</div>
             <div><span class="text-indigo-400">lpr -f samples/iis/u_extend01.log -g 500 -F c_ip,sc_status</span>    # Linux grep + awk</div>
             <div><span class="text-indigo-400">lpr -f samples/iis/u_extend01.log --stats</span>                     # GoAccess summary</div>
+            <div><span class="text-indigo-400">lpr history | lpr history -i | lpr --rerun 5 | lpr !5</span>      # DOS History</div>
+            <div><span class="text-indigo-400">lpr config  | lpr config --set-default ProdWeb</span>             # Saved Profiles</div>
             <div><span class="text-indigo-400">lpr -q -o:json "SELECT ..." | ConvertFrom-Json</span>          # PowerShell Objects</div>
-            <div><span class="text-indigo-400">lpr sdk</span>                                                 # .NET C# &amp; PS SDK</div>
-            <div><span class="text-indigo-400">lpr mcp</span>                                                 # AI Agent MCP Server</div>
+            <div><span class="text-indigo-400">lpr sdk     | lpr mcp    | lpr tui    | lpr serve</span>          # SDK / MCP / UI</div>
           </div>
           <div class="space-y-1.5 text-slate-300">
             <div><kbd class="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 mono">Cmd/Ctrl + Enter</kbd> — Execute SQL Query</div>
@@ -399,24 +434,27 @@
         <div class="flex items-center gap-2">
           <span class="text-lg">📂</span>
           <div>
-            <h3 class="text-sm font-bold text-white">Select Log File or Folder Glob</h3>
-            <p class="text-[11px] text-slate-400">Browse server directories or select all <code>*.log</code> files in a folder</p>
+            <h3 class="text-sm font-bold text-white">Select Log / CSV File or Folder Glob</h3>
+            <p class="text-[11px] text-slate-400">Click any file to load it, or query all <code>*.log</code> / <code>*.csv</code> files in the current folder</p>
           </div>
         </div>
         <button onclick="closeFileBrowser()" class="text-slate-400 hover:text-white text-lg font-bold px-2">✕</button>
       </div>
 
-      <div class="p-3 bg-slate-950/60 border-b border-slate-800 flex items-center gap-2 text-xs">
+      <div class="p-3 bg-slate-950/60 border-b border-slate-800 flex flex-wrap items-center gap-2 text-xs">
         <button id="btn-parent-dir" onclick="browseToParent()" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition shrink-0">
           ⬆️ Up Folder
         </button>
         <input id="browser-current-path" type="text" onkeydown="if(event.key==='Enter') browsePath(this.value)"
-          class="flex-1 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 mono text-xs text-slate-200 focus:outline-none focus:border-indigo-500" />
+          class="flex-1 min-w-[180px] px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 mono text-xs text-slate-200 focus:outline-none focus:border-indigo-500" />
         <button onclick="browsePath(document.getElementById('browser-current-path').value)" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition shrink-0">
           Go
         </button>
-        <button id="btn-select-glob" onclick="selectFolderGlob()" class="px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 font-semibold transition shrink-0">
-          ✨ Use *.log in Folder
+        <button id="btn-select-glob" onclick="selectFolderGlob('log')" class="px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 font-semibold transition shrink-0">
+          ✨ *.log in Folder
+        </button>
+        <button id="btn-select-csv-glob" onclick="selectFolderGlob('csv')" class="px-3 py-1.5 rounded-lg bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 border border-cyan-500/30 font-semibold transition shrink-0">
+          📊 *.csv in Folder
         </button>
       </div>
 
@@ -426,7 +464,7 @@
   </div>
 
   <footer class="border-t border-slate-800/60 py-4 px-6 text-center text-xs text-slate-500">
-    <span>lpr Studio v1.4.1 • Modern SQL Log Parser &amp; Security Auditor • Built in Rust with Apache Arrow &amp; DataFusion • Made using vibe coding by Sunil Warrier</span>
+    <span>lpr Studio v1.4.4 • Modern SQL Log Parser, Fleet Scanner &amp; Security Auditor • Built in Rust with Apache Arrow &amp; DataFusion • Made using vibe coding by Sunil Warrier</span>
   </footer>
 
   <script>
@@ -435,6 +473,7 @@
     let activeSuggestions = [];
     let parentDirPath = null;
     let currentFolderGlob = '*.log';
+    let currentFolderCsvGlob = '*.csv';
 
     const SQL_KEYWORDS_AND_UDFS = [
       { token: 'SELECT ', kind: 'SQL', desc: 'Select columns or expressions' },
@@ -743,15 +782,16 @@
         document.getElementById('browser-current-path').value = data.current_dir || '.';
         parentDirPath = data.parent_dir || null;
         currentFolderGlob = data.glob_all_logs || '*.log';
+        currentFolderCsvGlob = data.glob_all_csvs || '*.csv';
 
         const list = document.getElementById('browser-entries');
         if (!data.entries || data.entries.length === 0) {
-          list.innerHTML = '<div class="p-6 text-center text-slate-500">No subdirectories or matching log files in this directory.</div>';
+          list.innerHTML = '<div class="p-6 text-center text-slate-500">No subdirectories or matching log/CSV files in this directory.</div>';
           return;
         }
 
         list.innerHTML = data.entries.map(entry => {
-          const icon = entry.is_dir ? '📁' : '📄';
+          const icon = entry.is_dir ? '📁' : (entry.name.toLowerCase().endsWith('.csv') ? '📊' : '📄');
           const sizeStr = entry.is_dir ? 'Folder' : formatBytes(entry.size_bytes);
           const safePath = entry.path.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
           const action = entry.is_dir ? `browsePath('${safePath}')` : `selectBrowserFile('${safePath}')`;
@@ -774,8 +814,8 @@
       runQuery();
     }
 
-    async function selectFolderGlob() {
-      document.getElementById('source').value = currentFolderGlob;
+    async function selectFolderGlob(kind) {
+      document.getElementById('source').value = (kind === 'csv') ? currentFolderCsvGlob : currentFolderGlob;
       document.getElementById('format').value = 'auto';
       closeFileBrowser();
       await refreshSchemaAndIntents(true);
@@ -915,9 +955,9 @@
 
     function renderError(msg) {
       const t = document.getElementById('result-table');
-      t.innerHTML = `<tbody><tr><td class="p-6 text-center text-rose-400 bg-rose-950/20 border-t border-rose-900/40 mono text-xs">
-        <div class="font-bold mb-1">⚠️ Query Execution Failed</div>
-        <div class="text-slate-300">${escapeHtml(msg)}</div>
+      t.innerHTML = `<tbody><tr><td class="p-6 text-left text-rose-400 bg-rose-950/20 border-t border-rose-900/40 mono text-xs">
+        <div class="font-bold text-sm mb-2">⚠️ Query Execution Failed</div>
+        <pre class="text-slate-200 whitespace-pre-wrap leading-relaxed font-mono text-xs">${escapeHtml(msg)}</pre>
       </td></tr></tbody>`;
       document.getElementById('stat-rows').innerText = '0 rows';
       document.getElementById('stat-threats').classList.add('hidden');
@@ -941,7 +981,8 @@
 
         if (!res.ok || payload.error) {
           container.innerHTML = `<div class="p-6 rounded-2xl bg-rose-950/20 border border-rose-900/40 text-rose-400 text-xs mono">
-            <strong>Audit Failed:</strong> ${escapeHtml(payload.error || 'Unknown audit error')}
+            <div class="font-bold text-sm mb-2">⚠️ Audit Failed</div>
+            <pre class="text-slate-200 whitespace-pre-wrap leading-relaxed font-mono text-xs">${escapeHtml(payload.error || 'Unknown audit error')}</pre>
           </div>`;
           return;
         }
@@ -1044,7 +1085,15 @@
     });
 
     window.addEventListener('DOMContentLoaded', async () => {
-      await refreshSchemaAndIntents(false);
+      try {
+        const infoRes = await fetch('/v1/info');
+        const info = await infoRes.json();
+        if (info && info.default_source) {
+          document.getElementById('source').value = info.default_source;
+          document.getElementById('sql').value = 'SELECT * FROM logs LIMIT 50';
+        }
+      } catch (_) {}
+      await refreshSchemaAndIntents(true);
       runQuery();
     });
   </script>
