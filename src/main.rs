@@ -45,7 +45,7 @@ pub fn get_ascii_banner() -> String {
     version = LPR_VERSION,
     disable_version_flag = true,
     about = "Modern Multi-Threaded Rust SQL Log Parser, Fleet Scanner, Journey Tracer & Security Auditor",
-    long_about = "High-performance vectorized & multi-threaded log engine powered by Apache Arrow, DataFusion & Rayon.\nReads uncompressed logs, CSVs, .zip archives, .gz, and .zst streams directly across CPU cores.\nSupports ANSI SQL, Microsoft Log Parser 2.2 syntax (`-i:IISW3C`, `SELECT TOP 10 ... INTO out.csv FROM *.log`), multi-server fleet scanning (`lpr fleet`), deterministic session intelligence & cross-server user journey reconstruction (`--learn`, `--trace`, `--customer`, `--trace-ip`), Linux CLI filters (`-g`, `-v`, `-F`, `--stats`), .NET/PowerShell integration (`lpr sdk`), HTTP Web Studio (`lpr serve`), Terminal UI (`lpr tui`), and AI MCP (`lpr mcp`).",
+    long_about = "High-performance vectorized & multi-threaded log engine powered by Apache Arrow, DataFusion & Rayon.\nReads uncompressed logs, CSVs, .zip archives, .gz, and .zst streams directly across CPU cores.\nFormats: IIS W3C, IIS SMTP, Nginx, Apache, Caddy, HAProxy, Syslog, Firewall KV, Cisco ASA/Config, CEF, AWS (ALB/VPC/S3), Azure, GCP, EVTX, JSON/NDJSON, CSV/TSV, Excel (.xlsx/.xls), Parquet & custom Regex.\nSupports ANSI SQL, Microsoft Log Parser 2.2 syntax (`-i:IISW3C`, `SELECT TOP 10 ... INTO out.csv FROM *.log`), multi-server fleet scanning (`lpr fleet`), deterministic session intelligence & cross-server user journey reconstruction (`--learn`, `--trace`, `--customer`, `--trace-ip`), Linux CLI filters (`-g`, `-v`, `-F`, `--stats`), .NET/PowerShell integration (`lpr sdk`), HTTP Web Studio (`lpr serve`), Terminal UI (`lpr tui`), and AI MCP (`lpr mcp`).",
     after_help = r#"COMPLETE EXAMPLES & COMMON WORKFLOWS:
   1. Single-File / Wildcard / Archive SQL & Plain-English Query (Log Parser 2.2, ANSI SQL & Natural English):
      lpr -f "D:\Logs\W3SVC1\*.log" "SELECT TOP 25 date, time, c_ip, cs_uri_stem, sc_status, time_taken FROM logs WHERE sc_status LIKE '5%'"
@@ -71,12 +71,25 @@ pub fn get_ascii_banner() -> String {
      lpr config   |  lpr config --set-default ProdWeb
      lpr tui -f "D:\Logs\u_ex261016.log"                                  # Interactive Terminal UI (F1=Help, F2=Intents, F3=Browse)
      lpr serve --bind 127.0.0.1:8080                                      # Web Studio UI & REST API
-     lpr help-full                                                        # Print the complete multi-page reference manual"#
+     lpr --man  |  lpr --help -d  |  lpr help-full                        # Full manual (all 20+ formats, SQL recipes & UDFs)
+     lpr --samples                                                        # Extract sample logs & ready-to-run queries"#
 )]
 struct Cli {
     /// Print version information
     #[arg(long = "version", action = clap::ArgAction::Version)]
     version: Option<bool>,
+
+    /// Print the complete reference manual (all formats, SQL recipes, fleet, UDFs)
+    #[arg(long = "man", alias = "manual")]
+    man: bool,
+
+    /// Detailed help (use with `--help -d` or `-d` to print the full manual)
+    #[arg(short = 'd', long = "detailed")]
+    detailed: bool,
+
+    /// Extract ready-to-run synthetic sample log files into ./lpr_samples and print example queries
+    #[arg(long = "samples")]
+    samples: bool,
     /// ANSI SQL, Microsoft Log Parser 2.2 query, or lnav filter (`:filter-in <pat>`)
     #[arg(value_name = "SQL_QUERY")]
     query: Option<String>,
@@ -264,9 +277,16 @@ enum Commands {
         target: String,
     },
 
-    /// Display the complete interactive reference manual (Log Parser 2.2, Linux tools, UDFs, .NET/PS, API/MCP)
-    #[command(name = "help-full", alias = "manual", alias = "cheatsheet")]
+    /// Display the complete interactive reference manual (Log Parser 2.2, all formats, Linux tools, UDFs, .NET/PS, API/MCP)
+    #[command(name = "help-full", alias = "manual", alias = "cheatsheet", alias = "man")]
     HelpFull,
+
+    /// Extract ready-to-run synthetic sample log files and print example queries
+    Samples {
+        /// Output directory for sample files (default: ./lpr_samples)
+        #[arg(value_name = "OUT_DIR")]
+        out_dir: Option<String>,
+    },
 
     /// Launch the native desktop window application (lpr Studio)
     Gui {
@@ -795,9 +815,91 @@ pub fn print_full_manual() {
                         extract_filename(p), extract_path(p), extract_extension(p),
                         win32_error_description(code), reversedns(ip), to_timestamp(d, t),
                         index_of(s, sub), strlen(s), to_uppercase(s), to_lowercase(s), to_int(s), to_real(s)
+
+10. ALL SUPPORTED LOG & DATA FORMATS (20+ FORMATS) & SAMPLE EXTRACTION
+--------------------------------------------------------------------------------
+  • Web & Proxy Logs:
+    -i:IISW3C / w3c       IIS W3C Extended logs (auto-reads #Fields: rotations)
+    -i:SMTP               IIS SMTPSVC logs (MAIL/RCPT/EHLO/AUTH/VRFY)
+    -i:NGINX              Nginx access/error logs
+    -i:APACHE             Apache / httpd Common & Combined logs
+    -i:CADDY              Caddy JSON access logs
+    -i:HAPROXY            HAProxy HTTP/TCP logs
+  • Security, Network & Firewall Logs:
+    -i:SYSLOG             Linux /var/log/auth.log, syslog
+    -i:FIREWALL           Key=value firewall logs (Fortinet, Palo Alto, iptables)
+    -i:CISCO_ASA          Cisco ASA syslog (%ASA-4 / %ASA-6 events)
+    -i:CISCO_CONFIG       Cisco IOS running-config / ACLs (`lpr audit` checks weak secrets & permit any)
+    -i:CEF                ArcSight / SIEM Common Event Format
+    -i:EVTX               Windows Event Logs (.evtx binary or EVTX-as-JSON)
+  • Cloud, Structured & Tabular Data:
+    -i:AWS_ALB            AWS Application Load Balancer access logs
+    -i:AWS_VPC_FLOW       AWS VPC Flow Logs
+    -i:AWS_S3             AWS S3 Server Access Logs
+    -i:AZURE              Azure Activity JSON logs
+    -i:GCP                GCP Cloud Audit JSON logs
+    -i:JSON               JSON / NDJSON / JSONL event streams
+    -i:CSV / -i:TSV       CSV / TSV files (e.g. querying `lpr fleet` output CSVs)
+    -i:EXCEL              Excel workbooks (.xlsx / .xls)
+    -i:PARQUET            Apache Parquet files
+    -i:RAW / --regex-pattern "<regex>"   Line-by-line raw or custom named-capture regex
+  • Archives & Compression (auto-detected, no unzip needed):
+    .zip (parallel multi-entry), .gz, .zst, stdin (`-`), UTF-16/Win-1252/UTF-8
+
+  • Extract sample logs & ready-to-run queries anywhere (even standalone lpr.exe):
+    lpr --samples
+    lpr samples my_samples
 "#,
         LPR_VERSION
     );
+}
+
+pub fn extract_and_print_samples(out_dir: Option<&str>) -> Result<()> {
+    let dir = std::path::Path::new(out_dir.unwrap_or("lpr_samples"));
+    std::fs::create_dir_all(dir)?;
+
+    let files: &[(&str, &str)] = &[
+        ("iis_u_extend01.log", include_str!("../samples/iis/u_extend01.log")),
+        ("nginx_access.log", include_str!("../samples/nginx/access.log")),
+        ("firewall.log", include_str!("../samples/firewall/firewall.log")),
+        ("cisco_router.cfg", include_str!("../samples/cisco_config/router.cfg")),
+        ("cloud_events.ndjson", include_str!("../samples/json_logs/events.ndjson")),
+        ("aws_alb_access.log", include_str!("../samples/aws/alb_access.log")),
+    ];
+
+    println!("{}", get_ascii_banner());
+    println!(" {SYM_DONE} Extracted {} sample log files into `{}`:\n", files.len(), dir.display());
+    for (name, content) in files {
+        let path = dir.join(name);
+        std::fs::write(&path, content)?;
+        println!("   • {}", path.display());
+    }
+
+    let d = dir.display();
+    println!(
+        r#"
+READY-TO-RUN SAMPLE QUERIES:
+  1. IIS W3C (5xx errors & latency):
+     lpr -f "{d}/iis_u_extend01.log" "SELECT date, time, c_ip, cs_uri_stem, sc_status, time_taken FROM logs WHERE sc_status LIKE '5%'"
+
+  2. Nginx OWASP Threat Detection & Audit:
+     lpr -f "{d}/nginx_access.log" "SELECT remote_addr, request_uri, status, detect_threat(request_uri) AS threat FROM logs"
+     lpr audit "{d}/nginx_access.log"
+
+  3. Firewall Key-Value Aggregation:
+     lpr -f "{d}/firewall.log" "SELECT action, COUNT(*) AS hits, SUM(TRY_CAST(sentbyte AS BIGINT)) AS sent_bytes FROM logs GROUP BY action"
+
+  4. Cisco Config Security Audit:
+     lpr audit "{d}/cisco_router.cfg"
+
+  5. Cloud JSON Events & PII Masking:
+     lpr -f "{d}/cloud_events.ndjson" "SELECT * FROM logs LIMIT 10"
+
+  6. AWS ALB Access Logs:
+     lpr -f "{d}/aws_alb_access.log" "SELECT elb_status_code, COUNT(*) AS hits FROM logs GROUP BY 1"
+"#
+    );
+    Ok(())
 }
 
 async fn run_suggest_command(
@@ -1011,6 +1113,13 @@ async fn run_cli() -> Result<()> {
         return Ok(());
     }
 
+    let has_help_flag = raw_args.iter().any(|a| a == "-h" || a == "--help");
+    let has_detailed_flag = raw_args.iter().any(|a| a == "-d" || a == "--detailed");
+    if raw_args.len() <= 3 && has_help_flag && has_detailed_flag {
+        print_full_manual();
+        return Ok(());
+    }
+
     let mut processed_args = preprocess_cli_args(raw_args.clone());
     let matches = Cli::command()
         .before_help(get_ascii_banner())
@@ -1019,6 +1128,13 @@ async fn run_cli() -> Result<()> {
         .unwrap_or_else(|e| e.exit());
     if cli.ascii {
         sym::force_ascii();
+    }
+    if cli.man || (cli.detailed && cli.command.is_none() && cli.file.is_none() && cli.query.is_none()) {
+        print_full_manual();
+        return Ok(());
+    }
+    if cli.samples {
+        return extract_and_print_samples(None);
     }
 
     // Handle history listing, interactive DOS Up/Down arrow browsing, or rerunning command #N
@@ -1105,6 +1221,7 @@ async fn run_cli() -> Result<()> {
             Some(Commands::Config { .. })
                 | Some(Commands::History { .. })
                 | Some(Commands::HelpFull)
+                | Some(Commands::Samples { .. })
                 | Some(Commands::Sdk { .. })
         );
     if !is_meta_only && raw_args.len() > 1 {
@@ -1143,6 +1260,9 @@ async fn run_cli() -> Result<()> {
         Some(Commands::HelpFull) => {
             print_full_manual();
             return Ok(());
+        }
+        Some(Commands::Samples { out_dir }) => {
+            return extract_and_print_samples(out_dir.as_deref());
         }
         Some(Commands::Gui { source }) => return gui::launch_native_desktop_gui(source),
         Some(Commands::Tui { file, input_format }) => {
