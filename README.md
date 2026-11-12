@@ -411,4 +411,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## 📜 License
 
 Released under the **MIT License** and **The Unlicense** (dual-licensed).  
-**Made using vibe coding by Sunil Warrier**
+**Developed by Sunil Warrier**
+
+## ⚠️ Disclaimer
+
+LPR is an independent open-source project by Sunil Warrier and is not affiliated with, endorsed by, or sponsored by Microsoft Corporation. *Microsoft* and *Log Parser* are trademarks of Microsoft Corporation, referenced solely to indicate query syntax compatibility.

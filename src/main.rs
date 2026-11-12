@@ -791,7 +791,7 @@ pub fn print_full_manual() {
   • `--max-width 80`:   Truncates wide table cells so ASCII tables fit cleanly (`--max-width 0` for unlimited width)
   • `-G` / `--vertical`: Displays each record vertically (`key : value` cards) for wide logs
 
-7. MICROSOFT LOG PARSER 2.2 DROP-IN SYNTAX
+7. LOG PARSER 2.2-COMPATIBLE SYNTAX
 --------------------------------------------------------------------------------
   • Query files/globs/zips in SQL FROM & write to file via SQL INTO:
     lpr -i:IISW3C "SELECT TOP 10 cs-uri-stem, [sc-status], [time-taken] INTO out.csv FROM 'samples/iis/u_extend01.log' WHERE sc-status LIKE '5%'"
@@ -849,6 +849,13 @@ pub fn print_full_manual() {
   • Extract sample logs & ready-to-run queries anywhere (even standalone lpr.exe):
     lpr --samples
     lpr samples my_samples
+
+11. DISCLAIMER
+--------------------------------------------------------------------------------
+  LPR is an independent open-source project by Sunil Warrier and is not
+  affiliated with, endorsed by, or sponsored by Microsoft Corporation. Microsoft
+  and Log Parser are trademarks of Microsoft Corporation, referenced solely to
+  indicate query syntax compatibility.
 "#,
         LPR_VERSION
     );
