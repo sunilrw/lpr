@@ -1012,7 +1012,11 @@ async fn run_cli() -> Result<()> {
     }
 
     let mut processed_args = preprocess_cli_args(raw_args.clone());
-    let mut cli = Cli::parse_from(processed_args);
+    let matches = Cli::command()
+        .before_help(get_ascii_banner())
+        .get_matches_from(processed_args);
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| e.exit());
     if cli.ascii {
         sym::force_ascii();
     }
