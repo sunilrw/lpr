@@ -953,7 +953,7 @@ pub async fn run_fleet_scan(req: FleetScanConfig) -> Result<()> {
 
     fs::create_dir_all(&output_dir)?;
 
-    println!("================================================================================");
+    println!("{}", crate::get_ascii_banner());
     println!(" {SYM_GLOBE} LPR MULTI-SERVER FLEET SCANNER (Profile: `{}`)", active_profile_name);
     println!(
         " {SYM_CAL} {} | {} | Threads: {}{}",

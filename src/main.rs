@@ -29,13 +29,10 @@ pub const LPR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn get_ascii_banner() -> String {
     format!(
-        r#"   ___             ___
-  / / |___  _ __  / _ \___ _ _ _ ___ ___ _ _
- / /| '_ \ '_ \/ /_\/ _ \ '_| '_/ -_) _ \ '_|
-/_/ |_.__/ .__/\__/\___/_| |_|  \___|___/_|
-         |_|   v{} — Multi-Threaded Rust SQL Log Engine & Security Auditor
-               Powered by Apache Arrow 53, DataFusion 42 & Rayon Parallel Engine
-               Made using vibe coding by Sunil Warrier
+        r#"   __   ___  ___    LPR v{} — Multi-Threaded Rust SQL Log Engine
+  / /  / _ \/ _ \   Powered by Apache Arrow 53 & DataFusion 42
+ / /__/ ___/ , _/   Developed by Sunil Warrier
+/____/_/  /_/|_|
 ================================================================================"#,
         LPR_VERSION
     )
@@ -1359,24 +1356,7 @@ async fn run_cli() -> Result<()> {
 
     // 1. Clear Startup Banner & Execution Plan Header (Log Parser + Modern Rust style)
     if show_status || log_file_writer.is_some() {
-        log_message(
-            &mut log_file_writer,
-            show_status,
-            "================================================================================",
-        );
-        log_message(
-            &mut log_file_writer,
-            show_status,
-            &format!(
-                " {SYM_SHIELD}  LPR v{} — Multi-Threaded Rust SQL Log Engine (DataFusion 42 / Arrow 53)",
-                LPR_VERSION
-            ),
-        );
-        log_message(
-            &mut log_file_writer,
-            show_status,
-            "================================================================================",
-        );
+        log_message(&mut log_file_writer, show_status, &get_ascii_banner());
         log_message(
             &mut log_file_writer,
             show_status,
