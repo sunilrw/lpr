@@ -29,10 +29,11 @@ pub const LPR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn get_ascii_banner() -> String {
     format!(
-        r#"   __   ___  ___    LPR v{} — Multi-Threaded Rust SQL Log Engine
-  / /  / _ \/ _ \   Powered by Apache Arrow 53 & DataFusion 42
- / /__/ ___/ , _/   Developed by Sunil Warrier
-/____/_/  /_/|_|
+        r#"
+   __   ___  ___
+  / /  / _ \/ _ \   LPR v{} — Multi-Threaded Rust SQL Log Engine
+ / /__/ ___/ , _/   Powered by Apache Arrow 53 & DataFusion 42
+/____/_/  /_/|_|    Developed by Sunil Warrier
 ================================================================================"#,
         LPR_VERSION
     )
